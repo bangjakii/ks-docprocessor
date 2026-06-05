@@ -636,6 +636,9 @@ ATURAN:
 5. JANGAN potong: company profile, proposal, laporan tahunan, presentasi, manual, SOP, brosur, atau dokumen yang judulnya jelas satu topik.
 6. BOLEH dipotong: file yang jelas berisi campuran dokumen berbeda (invoice+faktur+bank garansi, kontrak+BAST+referensi berbeda proyek, dll).
    Saat dipotong, tiap dokumen punya department/scope/project/subfolder sendiri.
+   PENTING soal halaman (0-indexed): range antar-dokumen TIDAK BOLEH overlap — tiap halaman
+   tepat milik SATU dokumen. Urut & sambung (page_start dok berikut = page_end dok sebelumnya + 1),
+   cakup semua halaman 0..TOTAL-1. Contoh 8 halaman: 0-1, 2-2, 3-4, 5-7 (BUKAN 0-1,1-2,2-3...).
 7. "subfolder": pakai yang sudah ada kalau cocok, buat baru kalau perlu. Nama singkat dan deskriptif.
 
 Balas HANYA JSON, tanpa penjelasan, tanpa backtick.
@@ -666,15 +669,20 @@ Format kalau DIPOTONG (tiap dokumen punya dept sendiri; invoice→Finance, penaw
         result["company"] = canonicalize_company(detected)
 
         if result.get("should_split") and result.get("documents"):
-            valid = []
-            for d in result["documents"]:
-                ps = max(0, int(d.get("page_start", 0)))
+            # Urutkan per page_start lalu paksa TAK overlap: tiap halaman tepat milik satu
+            # dokumen (page_start dok berikut > page_end dok sebelumnya). Range yang runtuh
+            # setelah di-clamp dibuang. Mencegah halaman terduplikat antar potongan.
+            valid, prev_end = [], -1
+            for d in sorted(result["documents"], key=lambda x: int(x.get("page_start", 0))):
+                ps = max(0, int(d.get("page_start", 0)), prev_end + 1)
                 pe = min(total_pages - 1, int(d.get("page_end", total_pages - 1)))
                 if ps <= pe:
-                    d["page_start"] = ps
-                    d["page_end"]   = pe
+                    d["page_start"], d["page_end"] = ps, pe
+                    prev_end = pe
                     valid.append(d)
             result["documents"] = valid
+            if not valid:                       # tak ada range valid → perlakukan utuh
+                result["should_split"] = False
 
         return result
 
@@ -688,6 +696,75 @@ Format kalau DIPOTONG (tiap dokumen punya dept sendiri; invoice→Finance, penaw
 
 # ── Eksekusi filing ───────────────────────────────────────────────────────────
 
+# Pemetaan subfolder freeform (mis. hasil split Claude: "Tagihan"/"Kwitansi"/"Faktur Pajak"/
+# "Laporan Progress") → nama subfolder KANONIK per departemen — biar konsisten dgn path-first.
+_CANON_SUB = {
+    "Finance": [
+        (("faktur", "pajak", "ppn", "pph"),                       "Faktur & Pajak"),
+        (("purchase order", "po ", "p.o", "pesanan pembelian"),   "Purchase Order"),
+        (("invoice",),                                            "Invoice"),
+        (("kwitansi", "tagihan", "pembayaran", "bukti bayar",
+          "rincian biaya", "permohonan pembayaran"),              "Pembayaran"),
+        (("bank garansi", "jaminan", "garansi bank"),             "Bank Garansi"),
+        (("laporan keuangan", "neraca", "laba rugi",
+          "aset", "aktiva", "audited"),                           "Laporan Keuangan & Aset"),
+    ],
+    "Operasional": [
+        (("bast", "berita acara", "serah terima"),                "BAST"),
+        (("perintah kerja", "spk", "work order"),                 "SPK"),
+        (("pengajuan barang", "permintaan barang",
+          "permintaan material"),                                 "Pengajuan Barang"),
+        (("surat jalan", "pengiriman", "delivery",
+          "tanda terima barang"),                                 "Pengiriman"),
+        (("laporan progres", "laporan progress", "realisasi",
+          "kemajuan", "progress report", "monitoring"),           "Laporan Progres"),
+        (("jadwal", "kalender", "schedule", "kurva s"),           "Jadwal"),
+        (("vendor", "supplier", "rekanan"),                       "Vendor"),
+        (("pengadaan", "logistik", "logistic"),                   "Pengadaan"),
+    ],
+    "Sales": [
+        (("penawaran", "quotation", "sph", "harga"),              "Penawaran Harga"),
+        (("tender", "lelang", "prakualifikasi", "sampul"),        "Tender"),
+    ],
+    "Legal": [
+        (("akta", "akte", "notaris"),                             "Akta"),
+        (("kontrak", "perjanjian", "mou"),                        "Kontrak"),
+        (("npwp",),                                               "NPWP"),
+        (("sertifikat tanah", "tanah"),                           "Tanah"),
+        (("izin", "legalitas", "nib", "siup", "tdp",
+          "domisili", "perizinan"),                               "Legalitas & Izin"),
+    ],
+    "Engineering": [
+        (("gambar", "drawing", "general arrangement"),            "Gambar"),
+        (("spesifikasi", "calculation", "perhitungan"),           "Spesifikasi & Perhitungan"),
+        (("sertifikat material", "mill cert", "material cert"),   "Sertifikat Material"),
+        (("brosur", "datasheet", "spec sheet"),                   "Brosur & Spesifikasi Alat"),
+    ],
+    "HR": [
+        (("tenaga ahli", "curriculum", "resume"),                 "Tenaga Ahli"),
+        (("sertifikasi personil", "sertifikat keahlian",
+          "sertifikat personil"),                                 "Sertifikasi Personil"),
+        (("pegawai", "kepegawaian", "karyawan",
+          "absensi", "gaji", "kontrak kerja"),                    "Kepegawaian"),
+    ],
+    "Marketing": [
+        (("company profile", "profil", "brosur", "compro"),       "Company Profile"),
+    ],
+}
+
+
+def canon_subfolder(department: str, subfolder: str) -> str:
+    """Map subfolder freeform → kanonik per dept (kalau cocok keyword). Subfolder
+    multi-segmen (mis. 'Vendor/Item') TIDAK diutak-atik. Tak cocok → apa adanya."""
+    if not subfolder or "/" in subfolder:
+        return subfolder
+    n = f" {subfolder.lower()} "
+    for kws, canon in _CANON_SUB.get(department, []):
+        if any(k in n for k in kws):
+            return canon
+    return subfolder
+
+
 def resolve_destination(company: str, unit: dict, folder_index: dict, index_lock: Lock,
                         canon_project: bool = True) -> dict:
     """
@@ -697,8 +774,10 @@ def resolve_destination(company: str, unit: dict, folder_index: dict, index_lock
     canon_project=False kalau nama proyek sudah dikanonikalisasi oleh pass rekonsiliasi.
     """
     department = sanitize(unit.get("department") or "Lainnya")
+    # Kanonikalisasi subfolder freeform (hasil split/analisis Claude) → nama kanonik per dept.
+    raw_sub = canon_subfolder(unit.get("department") or "Lainnya", str(unit.get("subfolder") or "Umum"))
     # subfolder boleh multi-level (mis. "Vendor/Item") — sanitize tiap segmen, pertahankan "/".
-    subfolder  = "/".join(s for s in (sanitize(x) for x in str(unit.get("subfolder") or "Umum").split("/")) if s) or "Umum"
+    subfolder  = "/".join(s for s in (sanitize(x) for x in raw_sub.split("/")) if s) or "Umum"
     scope      = (unit.get("scope") or "").strip().lower()
 
     # Kanonikalisasi nama proyek terhadap proyek yang sudah ada di perusahaan ini.
