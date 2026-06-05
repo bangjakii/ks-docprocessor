@@ -31,6 +31,7 @@ import re
 import shutil
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 from pathlib import Path
 from threading import Lock
 
@@ -43,6 +44,15 @@ logging.getLogger("pypdf").setLevel(logging.ERROR)     # jangan banjiri warning 
 # File HIGH yang cocok kriteria ini dicek-isi supaya bisa dipecah per-dokumen.
 SPLIT_PRONE_DEPTS = {"Finance", "Operasional"}
 SPLIT_MIN_PAGES   = 6
+
+# Ekstensi DOKUMEN yang ikut ditata (Office + CAD + gambar). Sisanya (software, font,
+# arsip .zip/.rar, .psd/.cdr/.ai, media, sistem) DILEWATI sebagai sampah.
+DOC_EXTS = {
+    ".pdf",
+    ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".rtf", ".csv",   # Office
+    ".dwg", ".dxf",                                                       # CAD
+    ".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp",                     # gambar
+}
 
 try:
     from tqdm import tqdm
@@ -240,7 +250,7 @@ def analyze(root: Path, only: str = None, limit: int = None):
         for dp, dirs, files in os.walk(root / top):
             dirs.sort()
             for f in files:
-                if not f.lower().endswith(".pdf"):
+                if Path(f).suffix.lower() not in DOC_EXTS:
                     continue
                 if limit and n_seen >= limit:
                     break
@@ -303,13 +313,36 @@ def analysis_from_path(row: dict) -> dict:
 STATE_FILE = Path("archive_ingest_state.jsonl")
 
 
+def _file_nonpdf(src: Path, analysis: dict, index, lock):
+    """Salin file NON-PDF (Office/CAD/gambar) ke folder tujuan dari path — nama & ekstensi asli."""
+    try:
+        company = P.sanitize(analysis.get("company") or P.UNIDENTIFIED)
+        with contextlib.redirect_stdout(io.StringIO()):
+            dest = P.resolve_destination(company, analysis, index, lock, canon_project=True)
+        out_path = P.unique_path(dest["out_dir"] / src.name)   # pertahankan nama+ekstensi asli
+        shutil.copy2(src, out_path)
+        return [{"source_file": src.name, "doc_name": src.stem,
+                 "company": company, "counterparty": None,
+                 "department": dest["department"], "project": dest["project"],
+                 "subfolder": dest["subfolder"], "relpath": dest["relpath"],
+                 "output_file": str(out_path), "split": False,
+                 "expire_date": None, "doc_number": None,
+                 "status": "ok", "processed_at": datetime.now().isoformat()}]
+    except Exception as e:
+        return [{"source_file": src.name, "status": "error",
+                 "error": str(e), "company": analysis.get("company")}]
+
+
 def _file_quietly(pdf_path, analysis, index, lock):
-    """file_document tapi tahan output ramai-nya; kembalikan logs (atau entri error)."""
+    """File satu dokumen tanpa output ramai. PDF → file_document (bisa split); non-PDF → salin utuh."""
+    src = Path(pdf_path)
+    if src.suffix.lower() != ".pdf":
+        return _file_nonpdf(src, analysis, index, lock)
     try:
         with contextlib.redirect_stdout(io.StringIO()):
-            return P.file_document(Path(pdf_path), analysis, index, lock, canon_project=True)
+            return P.file_document(src, analysis, index, lock, canon_project=True)
     except Exception as e:
-        return [{"source_file": Path(pdf_path).name, "status": "error",
+        return [{"source_file": src.name, "status": "error",
                  "error": str(e), "company": analysis.get("company")}]
 
 
@@ -427,10 +460,12 @@ def apply_plan(root: Path, dest: Path, plan: list, workers: int, analyze_uncerta
     if skipped:
         print(f"\n  ↻ Lanjut dari checkpoint: {skipped} file sudah beres → dilewati.")
 
-    # ── Gerbang split: HIGH di Finance/Operasional & multi-halaman → cek-isi ───
+    is_pdf = lambda r: r["path"].lower().endswith(".pdf")
+
+    # ── Gerbang split: HIGH PDF di Finance/Operasional & multi-halaman → cek-isi ─
     split_check = []
     if analyze_uncertain and split_check_enabled:
-        prone = [r for r in high if r["department"] in SPLIT_PRONE_DEPTS]
+        prone = [r for r in high if r["department"] in SPLIT_PRONE_DEPTS and is_pdf(r)]
         if prone:
             print(f"\n  ⊟ Cek halaman {len(prone)} file Finance/Operasional (deteksi bundel campur)...")
             keep = []
@@ -439,7 +474,13 @@ def apply_plan(root: Path, dest: Path, plan: list, workers: int, analyze_uncerta
             prone_set = {id(r) for r in prone}
             high = [r for r in high if id(r) not in prone_set] + keep
             print(f"    → {len(split_check)} bundel kandidat dialihkan ke analisis-isi (bisa dipecah).")
-    content_jobs = unc + split_check          # dua-duanya lewat analyze_pdf (split-aware)
+
+    # PDF ragu → analisis isi (Claude); non-PDF ragu → parkir (tak bisa dibaca isinya).
+    if analyze_uncertain:
+        content_jobs = [r for r in unc if is_pdf(r)] + split_check
+        park_jobs    = [r for r in unc if not is_pdf(r)]
+    else:
+        content_jobs, park_jobs = [], unc
 
     # ── Fase A: HIGH — salin langsung dari path (gratis) ──────────────────────
     print(f"\n  ▶ Fase A: {len(high)} file HIGH → salin langsung dari path (tanpa Claude)")
@@ -448,10 +489,11 @@ def apply_plan(root: Path, dest: Path, plan: list, workers: int, analyze_uncerta
             break
         record(_file_quietly(r["path"], analysis_from_path(r), index, lock), r["path"])
 
-    # ── Fase B: file ragu + bundel kandidat — analisis isi (berbayar) ─────────
-    if not abort.is_set() and analyze_uncertain and content_jobs:
-        print(f"\n  ▶ Fase B: {len(content_jobs)} file → analisis isi "
-              f"({len(unc)} ragu + {len(split_check)} cek-bundel, Claude paralel x{workers})")
+    # ── Fase B: PDF ragu + bundel kandidat — analisis isi (berbayar) ──────────
+    if not abort.is_set() and content_jobs:
+        print(f"\n  ▶ Fase B: {len(content_jobs)} PDF → analisis isi "
+              f"({len(content_jobs)-len(split_check)} ragu + {len(split_check)} cek-bundel, "
+              f"Claude paralel x{workers})")
 
         def work(r):
             if abort.is_set() or not root.exists():   # disk lepas → jangan bayar Claude
@@ -474,9 +516,12 @@ def apply_plan(root: Path, dest: Path, plan: list, workers: int, analyze_uncerta
                     record(out, futs[fu]["path"])
                 if n % 100 == 0:
                     alive()
-    elif not abort.is_set() and unc:                  # parkir tanpa Claude
-        print(f"\n  ▶ Fase B: {len(unc)} file ragu → parkir ke _Perlu Dicek (tanpa Claude)")
-        for i, r in enumerate(tqdm(unc, desc="    parkir", unit="f")):
+
+    # ── Parkir: file ragu yang tak dianalisis (non-PDF, atau semua jika --no-analyze) ─
+    if not abort.is_set() and park_jobs:
+        label = "non-PDF ragu" if analyze_uncertain else "file ragu"
+        print(f"\n  ▶ Parkir {len(park_jobs)} {label} → _Perlu Dicek (tanpa Claude)")
+        for i, r in enumerate(tqdm(park_jobs, desc="    parkir", unit="f")):
             if i % 200 == 0 and not alive():
                 break
             a = analysis_from_path(r)
@@ -592,7 +637,8 @@ def main():
 
     plan, per_company, per_conf, unknown, n, prop = analyze(root, args.only, args.limit)
 
-    print(f"  Total PDF dipindai : {n}")
+    n_pdf = sum(1 for r in plan if r["path"].lower().endswith(".pdf"))
+    print(f"  Total file dipindai: {n}  ({n_pdf} PDF + {n-n_pdf} non-PDF)")
     print(f"  Propagasi tender   : {prop.get('propagasi',0)} via sinyal grup, "
           f"{prop.get('default',0)} via default program\n")
     print(f"  ── Keyakinan penempatan ──")
@@ -603,8 +649,11 @@ def main():
         bar = "█" * int(pct / 2)
         print(f"    {k:5} {v:6d}  {pct:5.1f}%  {bar}")
     skip = per_conf.get("HIGH", 0)
-    print(f"\n  → Kandidat SKIP-Claude (HIGH): {skip} "
-          f"({100*skip/n:.1f}%)  | perlu analisis isi: {n-skip-per_conf.get('JUNK',0)}\n")
+    pdf_unc = sum(1 for r in plan if r["confidence"] in ("MED", "LOW")
+                  and r["path"].lower().endswith(".pdf"))
+    nonpdf_unc = (per_conf.get("MED", 0) + per_conf.get("LOW", 0)) - pdf_unc
+    print(f"\n  → HIGH (path, gratis): {skip} ({100*skip/n:.1f}%)  |  "
+          f"PDF ragu→Claude: {pdf_unc}  |  non-PDF ragu→parkir: {nonpdf_unc}\n")
 
     print(f"  ── PDF per perusahaan (dari path) ──")
     for comp, v in per_company.most_common():
@@ -631,12 +680,16 @@ def main():
     # ── Mode APPLY: konfirmasi dulu, baru tata ────────────────────────────────
     dest = Path(args.dest)
     unc = per_conf.get("MED", 0) + per_conf.get("LOW", 0)
-    est_usd = (0 if args.no_analyze else unc * 0.0124)
+    is_pdf = lambda r: r["path"].lower().endswith(".pdf")
+    unc_pdf = sum(1 for r in plan if r["confidence"] in ("MED", "LOW") and is_pdf(r))
+    est_usd = (0 if args.no_analyze else unc_pdf * 0.0124)
     print(f"\n{'='*70}\n  ⚠  MODE APPLY — akan MENYALIN file ke: {dest}")
     print(f"  • {per_conf.get('HIGH',0)} file HIGH  → salin langsung dari path (gratis)")
-    print(f"  • {unc} file ragu       → " +
-          ("PARKIR ke _Perlu Dicek (gratis)" if args.no_analyze
-           else f"analisis isi via Claude (≈ ${est_usd:.2f})"))
+    if args.no_analyze:
+        print(f"  • {unc} file ragu       → PARKIR ke _Perlu Dicek (gratis)")
+    else:
+        print(f"  • {unc_pdf} PDF ragu      → analisis isi via Claude (≈ ${est_usd:.2f})")
+        print(f"  • {unc-unc_pdf} non-PDF ragu  → PARKIR ke _Perlu Dicek (gratis)")
     print(f"  • {per_conf.get('JUNK',0)} file junk  → dilewati")
     if not args.no_analyze and not args.no_split_check:
         print(f"  • Cek-bundel: file HIGH Finance/Operasional multi-halaman dipecah (≈ $4)")
