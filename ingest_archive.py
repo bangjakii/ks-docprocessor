@@ -661,8 +661,23 @@ def _page_count_quiet(path):
         return 0
 
 
+def _collapse_to_whole(res: dict) -> dict:
+    """Split dimatikan → file disimpan UTUH. Kalau Claude mengusulkan pecah, promosikan
+    dokumen DOMINAN (rentang halaman terbanyak) jadi klasifikasi file utuh. Granularitas
+    pencarian nanti ditangani chunking per-halaman di Pinecone, bukan pemotongan file."""
+    docs = res.get("documents") or []
+    if docs:
+        primary = max(docs, key=lambda d: int(d.get("page_end", 0)) - int(d.get("page_start", 0)) + 1)
+        for k in ("department", "scope", "project", "subfolder", "doc_number", "expire_date"):
+            if primary.get(k) is not None:
+                res[k] = primary.get(k)
+        res.pop("documents", None)
+    res["should_split"] = False
+    return res
+
+
 def apply_plan(root: Path, dest: Path, plan: list, workers: int, analyze_uncertain: bool,
-               reconcile: bool = True, split_check_enabled: bool = True):
+               reconcile: bool = True, allow_split: bool = False):
     from threading import Event
     P.OUTPUT_DIR = dest                              # arahkan filing ke folder rapi baru
     fidx = dest / "folder_index.json"                # lanjutkan index lama biar konsisten
@@ -699,7 +714,7 @@ def apply_plan(root: Path, dest: Path, plan: list, workers: int, analyze_uncerta
 
     # ── Gerbang split: HIGH PDF di Finance/Operasional & multi-halaman → cek-isi ─
     split_check = []
-    if analyze_uncertain and split_check_enabled:
+    if analyze_uncertain and allow_split:
         prone = [r for r in high if r["department"] in SPLIT_PRONE_DEPTS and is_pdf(r)]
         if prone:
             print(f"\n  ⊟ Cek halaman {len(prone)} file Finance/Operasional (deteksi bundel campur)...")
@@ -744,6 +759,8 @@ def apply_plan(root: Path, dest: Path, plan: list, workers: int, analyze_uncerta
                 res = analysis_from_path(r)           # HIGH & ternyata BUKAN bundel → percaya path
             elif r["company"] != P.UNIDENTIFIED:      # path punya perusahaan yakin → menang
                 res["company"] = r["company"]
+            if not allow_split and res.get("should_split"):
+                res = _collapse_to_whole(res)         # default: simpan UTUH (granularitas via Pinecone)
             return _file_quietly(r["path"], res, index, lock)
 
         with ThreadPoolExecutor(max_workers=workers) as ex:
@@ -857,8 +874,9 @@ def main():
                     help="jangan analisis isi file ragu (parkir ke _Perlu Dicek, gratis)")
     ap.add_argument("--no-reconcile", action="store_true",
                     help="lewati Fase C (penyatuan nama proyek/subfolder kembar)")
-    ap.add_argument("--no-split-check", action="store_true",
-                    help="jangan cek-pecah bundel campur di Finance/Operasional multi-halaman")
+    ap.add_argument("--split", action="store_true",
+                    help="POTONG bundel campur jadi file per-dokumen (default: simpan UTUH). "
+                         "Untuk Pinecone granularitas via chunking, jadi split fisik biasanya tak perlu.")
     ap.add_argument("--yes", action="store_true", help="lewati konfirmasi y/n")
     ap.add_argument("--fresh", action="store_true",
                     help="abaikan checkpoint & mulai menata dari nol")
@@ -937,8 +955,10 @@ def main():
         print(f"  • {unc_pdf} PDF ragu      → analisis isi via Claude (≈ ${est_usd:.2f})")
         print(f"  • {unc-unc_pdf} non-PDF ragu  → PARKIR ke _Perlu Dicek (gratis)")
     print(f"  • {per_conf.get('JUNK',0)} file junk  → dilewati")
-    if not args.no_analyze and not args.no_split_check:
-        print(f"  • Cek-bundel: file HIGH Finance/Operasional multi-halaman dipecah (≈ $4)")
+    if args.split:
+        print(f"  • Cek-bundel (--split): file HIGH Finance/Operasional multi-halaman DIPECAH (≈ $4)")
+    else:
+        print(f"  • Bundel campur DISIMPAN UTUH (granularitas via chunking Pinecone). Pakai --split utk pecah.")
     if not args.no_reconcile:
         print(f"  • Fase C: rekonsiliasi nama proyek/subfolder kembar (Claude, ≈ $0.10–0.30)")
     print(f"  • File asli di {root} TIDAK disentuh (ini operasi SALIN).")
@@ -947,7 +967,7 @@ def main():
         print("\n  ❌ Dibatalkan.\n")
         return
     apply_plan(root, dest, plan, args.workers, analyze_uncertain=not args.no_analyze,
-               reconcile=not args.no_reconcile, split_check_enabled=not args.no_split_check)
+               reconcile=not args.no_reconcile, allow_split=args.split)
 
 
 if __name__ == "__main__":
