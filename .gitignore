@@ -23,3 +23,5 @@ archive_plan.jsonl
 _test_dest/
 archive_ingest_state.jsonl
 Arsip_Rapih/
+_test_run/
+_test_run.log

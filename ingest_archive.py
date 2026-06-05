@@ -534,7 +534,7 @@ def apply_plan(root: Path, dest: Path, plan: list, workers: int, analyze_uncerta
             if abort.is_set() or not root.exists():   # disk lepas → jangan bayar Claude
                 return None
             rel = str(Path(r["path"]).relative_to(root))
-            res = P.analyze_pdf(r["path"], index, path_hint=rel)
+            res = P.analyze_pdf(Path(r["path"]), index, path_hint=rel)
             if not res:                               # gagal baca → parkir pakai tebakan path
                 res = analysis_from_path(r)
                 res["department"] = r["department"] or "_Perlu Dicek"
