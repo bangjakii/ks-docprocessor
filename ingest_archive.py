@@ -287,6 +287,13 @@ _STRONG_COMPANY_KEYS = [(k, v) for k, v in P._ALL_KEYS.items() if " " in k]
 # Pasangan JV yang saling menyebut di banyak dokumen — jangan saling-tukar.
 _JV_PAIR = {"PT Krakatau Shipyard", "KSO DKB-KS"}
 
+# Folder top-level TANPA nama company yang sebenarnya milik satu company (backup/cadangan).
+# Dipakai sebagai default HANYA bila company tak terbaca dari path & override sister-company
+# tak menemukan apa pun — jadi sister-company/vendor di dalamnya tetap ter-pisah lebih dulu.
+TOP_DEFAULT_COMPANY = {
+    "back up": "PT Krakatau Shipyard",
+}
+
 
 def company_override(segments: list, stem: str, base_company: str):
     """
@@ -467,6 +474,11 @@ def analyze(root: Path, only: str = None, limit: int = None):
                 ov_comp, ov_seg = company_override(segments, stem, company)
                 if ov_comp:
                     company, cseg = ov_comp, ov_seg
+                # Backup tanpa nama company → default ke pemiliknya (setelah override sister-company).
+                if company == P.UNIDENTIFIED:
+                    td = TOP_DEFAULT_COMPANY.get(norm(top))
+                    if td:
+                        company, cseg = td, top
                 project, _ = project_from_path(segments)      # folder saja, BUKAN nama file
                 # Departemen + subfolder KANONIK (jenis dokumen) dari path/nama file.
                 dept, doc_sub, dseg = classify_doctype(segments + [stem])
