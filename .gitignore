@@ -1,0 +1,21 @@
+# Secrets — NEVER commit
+.env
+
+# Data — too large / not source
+inbox/
+output/
+processing_log.json
+folder_index.json
+
+# Logs
+*.log
+
+# Bundled binaries
+poppler/
+poppler-26.02.0/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
