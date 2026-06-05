@@ -100,13 +100,49 @@ DEPT_KEYWORDS = [
     ("IT",               ["website", " web ", "lpse akun", "akun lpse"]),
 ]
 
-# ── Pola proyek: kalau salah satu muncul di segmen, segmen itu kandidat proyek ─
-PROJECT_HINTS = [
-    "kapal", "ponton", "tongkang", "dock", " dok ", "floating dock", " fd ", "fd-",
-    "kontainer", "container", "teus", "perintis", "patroli", "tugboat", "tug boat",
-    "barge", "fpv", "dwt", " gt", "penumpang", "pertamina", "kpdt", "perhubungan",
-    "replating", "docking", "fighting craft", "buoyant", "fiberglass", "pelra",
-    "puloampel", "dermaga", "graving", "graADL",
+# ── Proyek KANONIK ────────────────────────────────────────────────────────────
+# Daripada memungut teks folder mentah (yang menarik nama orang/jenis-dokumen/komponen
+# jadi "proyek"), kita cocokkan path ke pola proyek NYATA. Tiap entri: (semua keyword
+# harus ada di path) → nama proyek bersih. Urutan = spesifik dulu. Yang tak cocok pola
+# mana pun → BUKAN proyek (None) → masuk _Tanpa Proyek / level perusahaan, bukan folder sampah.
+# Keyword dengan spasi (mis. " fd ", " gt ") = harus token utuh.
+PROJECT_CANON = [
+    (["perintis", "2000"],          "Kapal Perintis 2000 GT"),
+    (["kontainer", "100"],          "Kapal Kontainer 100 TEUS"),
+    (["container", "100"],          "Kapal Kontainer 100 TEUS"),
+    (["kontainer", "teus"],         "Kapal Kontainer 100 TEUS"),
+    (["container", "teus"],         "Kapal Kontainer 100 TEUS"),
+    (["kontainer paket n"],         "Kapal Kontainer 100 TEUS"),
+    (["pertamina", "17500"],        "Tanker Pertamina 17500 DWT"),
+    (["fighting craft"],            "Patroli Pertamina"),
+    (["rigid buoyant"],             "Patroli Pertamina"),
+    (["buoyant boat"],              "Patroli Pertamina"),
+    (["fpv"],                       "Patroli FPV"),
+    (["patroli"],                   "Patroli FPV"),
+    (["floating dock"],             "Floating Dock"),
+    ([" fd "],                      "Floating Dock"),
+    (["fd-"],                       "Floating Dock"),
+    (["rehabilitasi dock"],         "Rehabilitasi Dock Surabaya"),
+    (["pelra"],                     "Kapal Pelra (Kayu)"),
+    (["50 penumpang"],              "Kapal 50 Penumpang"),
+    (["20 penumpang"],              "Kapal 20 Penumpang"),
+    (["kpdt"],                      "Tender KPDT"),
+    (["bus air"],                   "Bus Air Danau Toba"),
+    (["100 penumpang"],             "Bus Air Danau Toba"),
+    (["rivercat"],                  "RiverCAT RoRo 150 PAX"),
+    ([" roro "],                    "Kapal RoRo"),
+    (["ro ro"],                     "Kapal RoRo"),
+    (["suction dredger"],           "Suction Dredger Boat"),
+    (["dredger"],                   "Suction Dredger Boat"),
+    (["isap lumpur"],               "Kapal Isap Lumpur"),
+    (["replating"],                 "Replating MT Pelita"),
+    (["mt pelita"],                 "Replating MT Pelita"),
+    (["ponton"],                    "Ponton"),
+    (["tongkang"],                  "Tongkang"),
+    (["deck barge"],                "Tongkang"),
+    (["tugboat"],                   "Tugboat"),
+    (["tug boat"],                  "Tugboat"),
+    (["docking"],                   "Docking & Reparasi Kapal"),
 ]
 
 # ── Pola junk (folder aset/software, bukan dokumen) ───────────────────────────
@@ -209,16 +245,15 @@ def dept_from_path(segments: list) -> tuple:
     return None, None
 
 
-def project_from_path(segments: list, company_seg, dept_seg) -> tuple:
-    """Segmen kandidat proyek paling spesifik (dalam→dangkal). Return (proj_or_None, seg)."""
-    for seg in reversed(segments):
-        if seg in (company_seg, dept_seg):
-            continue
-        n = norm(seg)
-        if any(h in f" {n} " for h in PROJECT_HINTS):
-            # bersihkan nomor urut depan ("4. patroli ..." → "patroli ...")
-            clean = re.sub(r"^\s*[ivxlc]+\.?\s+|^\s*\d+\.?\s+", "", seg, flags=re.I).strip()
-            return clean, seg
+def project_from_path(segments: list, *_) -> tuple:
+    """
+    Cocokkan path ke proyek KANONIK. Cuma folder (BUKAN nama file) yang dipertimbangkan.
+    Return (nama_proyek_kanonik_or_None, None). Tak cocok pola → None (bukan folder sampah).
+    """
+    blob = " " + " ".join(norm(s) for s in segments) + " "
+    for keys, canon in PROJECT_CANON:
+        if all(k in blob for k in keys):
+            return canon, None
     return None, None
 
 
@@ -262,7 +297,7 @@ def analyze(root: Path, only: str = None, limit: int = None):
 
                 company, cseg = company_from_path(segments)
                 dept, dseg = dept_from_path(segments + [stem])
-                project, _ = project_from_path(segments + [stem], cseg, dseg)
+                project, _ = project_from_path(segments)      # folder saja, BUKAN nama file
 
                 plan.append({
                     "path": str(full), "top": top, "segments": segments[1:],
