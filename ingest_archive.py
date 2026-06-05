@@ -29,6 +29,7 @@ import logging
 import os
 import re
 import shutil
+import sys
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -37,6 +38,14 @@ from threading import Lock
 
 import process_docs as P
 import refile_output as R
+
+# Konsol Windows default cp1252 → gagal cetak karakter box-drawing pohon.
+# Paksa stdout/stderr ke UTF-8 supaya pratinjau pohon & simbol aman.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
 
 logging.getLogger("pypdf").setLevel(logging.ERROR)     # jangan banjiri warning PDF rusak
 
@@ -103,6 +112,10 @@ DOCTYPE_RULES = [
                                                             "Engineering", "Sertifikat Material"),
     (["rancangan", "desain", "design", "piping", "machinery", "hull", "outfitting", "fmea",
       "teknis", "teknik"],                                  "Engineering", "Teknis"),
+    # Brosur/datasheet ALAT (Ring Buoy, Life Jacket, Radio VHF, GPS, dll) = spek teknis,
+    # bukan profil perusahaan. Lampiran teknis tender. (dulu salah masuk Marketing.)
+    (["brosur", "datasheet", "data sheet", "spec sheet", "katalog produk"],
+                                                            "Engineering", "Brosur & Spesifikasi Alat"),
     # — Operasional —
     (["bast", "berita acara", "serah terima"],              "Operasional", "BAST"),
     (["surat perintah kerja", " spk", "work order"],        "Operasional", "SPK"),
@@ -120,7 +133,7 @@ DOCTYPE_RULES = [
                                                             "Operasional", "Pengadaan"),
     # — Marketing — ("marketing"/"maketing" DIBUANG: cocok folder "MAKETING TENDER" → tender
     #   salah jadi Marketing. Pakai frasa spesifik dokumen marketing saja.)
-    (["company profile", "profil perusahaan", "brosur", "presentasi perusahaan",
+    (["company profile", "profil perusahaan", "presentasi perusahaan",
       "katalog perusahaan", "profil singkat perusahaan"], "Marketing", "Company Profile"),
     # — Legal (dokumen badan usaha) —
     (["akta", "akte", "notaris", "pengesahan"],             "Legal", "Akta"),
@@ -269,6 +282,78 @@ def company_from_path(segments: list) -> tuple:
     return P.UNIDENTIFIED, None
 
 
+# Kunci nama company "kuat" (multiword) — dipakai mendeteksi kepemilikan via nama file.
+_STRONG_COMPANY_KEYS = [(k, v) for k, v in P._ALL_KEYS.items() if " " in k]
+# Pasangan JV yang saling menyebut di banyak dokumen — jangan saling-tukar.
+_JV_PAIR = {"PT Krakatau Shipyard", "KSO DKB-KS"}
+
+
+def company_override(segments: list, stem: str, base_company: str):
+    """
+    Dokumen anak-company yang bersarang di tree company lain (mis. dok pajak
+    PT Indonesia Register di dalam folder KS). Override 'base_company' kalau:
+      (a) ada SEGMEN folder yang DIDEDIKASIKAN ke satu company grup
+          (nama folder == company, mis. '3. Indonesia Register'), ATAU
+      (b) NAMA LENGKAP satu company grup muncul di nama file.
+    Safety: hanya override kalau TEPAT SATU company (selain base) tersinyal —
+    kalau >1 (dokumen bersama, mis. 'KS - Lautan'), pertahankan base. Pasangan
+    JV (KS↔KSO) tak pernah saling-tukar lewat aturan ini.
+    Return (canon_company, pemicu) atau (None, None).
+    """
+    hits = {}
+    # (a) folder yang didedikasikan ke satu company (nama folder == company)
+    for seg in segments:
+        n = norm(_strip_num(seg))
+        if n and n in P._ALL_KEYS:
+            hits.setdefault(P._ALL_KEYS[n], seg)
+    # (b) nama lengkap company di nama file
+    sn = norm(stem)
+    for key, canon in _STRONG_COMPANY_KEYS:
+        if key in sn:
+            hits.setdefault(canon, stem)
+    hits.pop(base_company, None)
+    if len(hits) == 1:
+        canon, trig = next(iter(hits.items()))
+        if {canon, base_company} <= _JV_PAIR:
+            return None, None
+        return canon, trig
+    return None, None
+
+
+# Kata generik di nama compro yang BUKAN nama subjek (mengarah ke profil owner sendiri).
+_COMPRO_KW = ("company profile", "profil perusahaan", "presentasi perusahaan",
+              "katalog perusahaan", "profil singkat perusahaan", "compro", "profil")
+_COMPRO_GENERIC = {"revisi", "fix", "oke", "ok", "sample", "contoh", "draft", "final",
+                   "new", "baru", "untuk", "versi", "version", "wecompress", "com",
+                   "cover", "cp", "basarnas", "selalu", "lanjutan", "galeri", "logo"}
+# Akronim company GRUP (di nama file) — diperlakukan sebagai owner, bukan vendor luar.
+_INTERNAL_ACRONYMS = {"ks", "ikn", "ksd", "dkb", "kso", "hs", "lkg", "lbn"}
+
+
+def compro_vendor(stem: str):
+    """
+    Untuk dokumen 'Company Profile': tentukan apakah profil ini milik PIHAK LUAR
+    (vendor/partner) atau milik company grup sendiri. GATE: nama file-nya sendiri
+    HARUS menyebut 'company profile'/'profil'/'compro' — supaya file lain yang cuma
+    kebetulan ada di folder "Company Profile" (galeri, logo, uraian jabatan) tak
+    dianggap vendor. Subjek = company grup / akronim internal / kosong / generik →
+    None (tetap Marketing). Pihak luar → nama vendor (Title Case) → Operasional/<Vendor>.
+    """
+    n = norm(stem)
+    if not any(kw in n for kw in _COMPRO_KW):     # gate: harus dokumen profil betulan
+        return None
+    for kw in _COMPRO_KW:
+        n = n.replace(kw, " ")
+    toks = [t for t in n.split()
+            if t not in _COMPRO_GENERIC and not any(c.isdigit() for c in t)]
+    name = " ".join(toks).strip()
+    if not name or name in _INTERNAL_ACRONYMS:
+        return None
+    if company_from_path([name])[0] != P.UNIDENTIFIED:
+        return None
+    return name.title()
+
+
 def classify_doctype(segments: list):
     """
     Tebak (departemen, subfolder-kanonik, segmen-pemicu) dari JENIS dokumen di path
@@ -367,6 +452,8 @@ def analyze(root: Path, only: str = None, limit: int = None):
             for f in files:
                 if Path(f).suffix.lower() not in DOC_EXTS:
                     continue
+                if f.startswith("~$") or f.startswith("."):   # file lock/temp Office & dotfile
+                    continue
                 if limit and n_seen >= limit:
                     break
                 n_seen += 1
@@ -376,6 +463,10 @@ def analyze(root: Path, only: str = None, limit: int = None):
                 stem = Path(f).stem
 
                 company, cseg = company_from_path(segments)
+                # Anak-company yang bersarang di tree company lain → file ke company-nya sendiri.
+                ov_comp, ov_seg = company_override(segments, stem, company)
+                if ov_comp:
+                    company, cseg = ov_comp, ov_seg
                 project, _ = project_from_path(segments)      # folder saja, BUKAN nama file
                 # Departemen + subfolder KANONIK (jenis dokumen) dari path/nama file.
                 dept, doc_sub, dseg = classify_doctype(segments + [stem])
@@ -389,6 +480,13 @@ def analyze(root: Path, only: str = None, limit: int = None):
                         subfolder = f"{vendor}/{item}" if item else vendor
                     elif doc_sub == "Pengadaan" and item:
                         subfolder = item
+                # Compro VENDOR/partner (pihak luar) → dossier vendor di Operasional,
+                # bukan Marketing owner. Profil owner sendiri tetap Marketing.
+                if dept == "Marketing" and doc_sub == "Company Profile":
+                    v = compro_vendor(stem)
+                    if v:
+                        dept = "Operasional"
+                        subfolder = f"{v}/Company Profile"
 
                 plan.append({
                     "path": str(full), "top": top, "segments": segments[1:],
