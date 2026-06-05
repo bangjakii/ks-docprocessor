@@ -25,6 +25,7 @@ import argparse
 import contextlib
 import io
 import json
+import logging
 import os
 import re
 import shutil
@@ -35,6 +36,13 @@ from threading import Lock
 
 import process_docs as P
 import refile_output as R
+
+logging.getLogger("pypdf").setLevel(logging.ERROR)     # jangan banjiri warning PDF rusak
+
+# Bundel campur (invoice+faktur+PO) hampir selalu di Finance/Operasional & multi-halaman.
+# File HIGH yang cocok kriteria ini dicek-isi supaya bisa dipecah per-dokumen.
+SPLIT_PRONE_DEPTS = {"Finance", "Operasional"}
+SPLIT_MIN_PAGES   = 6
 
 try:
     from tqdm import tqdm
@@ -377,8 +385,16 @@ def reconcile_dest(dest: Path, logs: list, index: dict):
     print(f"    ✓ {moved} file dipindah ke struktur kanonik.")
 
 
+def _page_count_quiet(path):
+    try:
+        with open(os.devnull, "w") as dn, contextlib.redirect_stderr(dn), contextlib.redirect_stdout(dn):
+            return P.get_page_count(path)
+    except Exception:
+        return 0
+
+
 def apply_plan(root: Path, dest: Path, plan: list, workers: int, analyze_uncertain: bool,
-               reconcile: bool = True):
+               reconcile: bool = True, split_check_enabled: bool = True):
     from threading import Event
     P.OUTPUT_DIR = dest                              # arahkan filing ke folder rapi baru
     fidx = dest / "folder_index.json"                # lanjutkan index lama biar konsisten
@@ -411,6 +427,20 @@ def apply_plan(root: Path, dest: Path, plan: list, workers: int, analyze_uncerta
     if skipped:
         print(f"\n  ↻ Lanjut dari checkpoint: {skipped} file sudah beres → dilewati.")
 
+    # ── Gerbang split: HIGH di Finance/Operasional & multi-halaman → cek-isi ───
+    split_check = []
+    if analyze_uncertain and split_check_enabled:
+        prone = [r for r in high if r["department"] in SPLIT_PRONE_DEPTS]
+        if prone:
+            print(f"\n  ⊟ Cek halaman {len(prone)} file Finance/Operasional (deteksi bundel campur)...")
+            keep = []
+            for r in tqdm(prone, desc="    cek-hlm", unit="f"):
+                (split_check if _page_count_quiet(r["path"]) >= SPLIT_MIN_PAGES else keep).append(r)
+            prone_set = {id(r) for r in prone}
+            high = [r for r in high if id(r) not in prone_set] + keep
+            print(f"    → {len(split_check)} bundel kandidat dialihkan ke analisis-isi (bisa dipecah).")
+    content_jobs = unc + split_check          # dua-duanya lewat analyze_pdf (split-aware)
+
     # ── Fase A: HIGH — salin langsung dari path (gratis) ──────────────────────
     print(f"\n  ▶ Fase A: {len(high)} file HIGH → salin langsung dari path (tanpa Claude)")
     for i, r in enumerate(tqdm(high, desc="    nyalin", unit="f")):
@@ -418,9 +448,10 @@ def apply_plan(root: Path, dest: Path, plan: list, workers: int, analyze_uncerta
             break
         record(_file_quietly(r["path"], analysis_from_path(r), index, lock), r["path"])
 
-    # ── Fase B: MED/LOW — analisis isi (berbayar) atau parkir ─────────────────
-    if not abort.is_set() and analyze_uncertain and unc:
-        print(f"\n  ▶ Fase B: {len(unc)} file ragu → analisis isi (Claude, paralel x{workers})")
+    # ── Fase B: file ragu + bundel kandidat — analisis isi (berbayar) ─────────
+    if not abort.is_set() and analyze_uncertain and content_jobs:
+        print(f"\n  ▶ Fase B: {len(content_jobs)} file → analisis isi "
+              f"({len(unc)} ragu + {len(split_check)} cek-bundel, Claude paralel x{workers})")
 
         def work(r):
             if abort.is_set() or not root.exists():   # disk lepas → jangan bayar Claude
@@ -435,7 +466,7 @@ def apply_plan(root: Path, dest: Path, plan: list, workers: int, analyze_uncerta
             return _file_quietly(r["path"], res, index, lock)
 
         with ThreadPoolExecutor(max_workers=workers) as ex:
-            futs = {ex.submit(work, r): r for r in unc}
+            futs = {ex.submit(work, r): r for r in content_jobs}
             for n, fu in enumerate(tqdm(as_completed(futs), total=len(futs),
                                         desc="    analisis", unit="f")):
                 out = fu.result()
@@ -542,6 +573,8 @@ def main():
                     help="jangan analisis isi file ragu (parkir ke _Perlu Dicek, gratis)")
     ap.add_argument("--no-reconcile", action="store_true",
                     help="lewati Fase C (penyatuan nama proyek/subfolder kembar)")
+    ap.add_argument("--no-split-check", action="store_true",
+                    help="jangan cek-pecah bundel campur di Finance/Operasional multi-halaman")
     ap.add_argument("--yes", action="store_true", help="lewati konfirmasi y/n")
     ap.add_argument("--fresh", action="store_true",
                     help="abaikan checkpoint & mulai menata dari nol")
@@ -605,6 +638,8 @@ def main():
           ("PARKIR ke _Perlu Dicek (gratis)" if args.no_analyze
            else f"analisis isi via Claude (≈ ${est_usd:.2f})"))
     print(f"  • {per_conf.get('JUNK',0)} file junk  → dilewati")
+    if not args.no_analyze and not args.no_split_check:
+        print(f"  • Cek-bundel: file HIGH Finance/Operasional multi-halaman dipecah (≈ $4)")
     if not args.no_reconcile:
         print(f"  • Fase C: rekonsiliasi nama proyek/subfolder kembar (Claude, ≈ $0.10–0.30)")
     print(f"  • File asli di {root} TIDAK disentuh (ini operasi SALIN).")
@@ -613,7 +648,7 @@ def main():
         print("\n  ❌ Dibatalkan.\n")
         return
     apply_plan(root, dest, plan, args.workers, analyze_uncertain=not args.no_analyze,
-               reconcile=not args.no_reconcile)
+               reconcile=not args.no_reconcile, split_check_enabled=not args.no_split_check)
 
 
 if __name__ == "__main__":
