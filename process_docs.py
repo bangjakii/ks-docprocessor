@@ -566,7 +566,7 @@ def save_pdf_pages(pdf_path: Path, page_start: int, page_end: int, out_path: Pat
 
 # ── Analisis Claude ───────────────────────────────────────────────────────────
 
-def analyze_pdf(pdf_path: Path, folder_index: dict) -> dict:
+def analyze_pdf(pdf_path: Path, folder_index: dict, path_hint: str = None) -> dict:
     total_pages = get_page_count(pdf_path)
     if total_pages == 0:
         return {}
@@ -574,11 +574,14 @@ def analyze_pdf(pdf_path: Path, folder_index: dict) -> dict:
     text     = extract_text(pdf_path)
     filename = pdf_path.name
     existing = describe_index(folder_index)
+    hint_block = (f"\nLOKASI ARSIP ASAL (petunjuk kuat dari struktur folder manusia — "
+                  f"prioritaskan untuk perusahaan/proyek bila isi dokumen ambigu):\n{path_hint}\n"
+                  if path_hint else "")
 
     prompt = f"""Kamu adalah asisten filing dokumen untuk grup perusahaan galangan kapal Indonesia.
 
 FILE: "{filename}"
-TOTAL HALAMAN: {total_pages}
+TOTAL HALAMAN: {total_pages}{hint_block}
 
 PERUSAHAAN GRUP (HANYA INI yang boleh jadi nilai "company" — WAJIB persis salah satu):
 {chr(10).join(f"- {c}" for c in COMPANIES)}

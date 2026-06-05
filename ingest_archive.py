@@ -22,13 +22,24 @@ Keyakinan:
 """
 
 import argparse
+import contextlib
+import io
 import json
 import os
 import re
+import shutil
 from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from threading import Lock
 
 import process_docs as P
+import refile_output as R
+
+try:
+    from tqdm import tqdm
+except ImportError:                       # fallback tanpa progress bar
+    def tqdm(x=None, **k): return x if x is not None else iter(())
 
 # ── Top-level yang dilewati (sistem / bukan dokumen) ──────────────────────────
 SKIP_TOP = {
@@ -265,16 +276,283 @@ def analyze(root: Path, only: str = None, limit: int = None):
     return plan, per_company, per_conf, unknown_tokens, n_seen, prop_stats
 
 
+# ── Mode APPLY: benar-benar menata file (SALIN) ke struktur bersih ────────────
+
+def analysis_from_path(row: dict) -> dict:
+    """Sintesis hasil analisis untuk file HIGH — langsung dari tebakan path, tanpa Claude."""
+    proj = P.normalize_project(row.get("project"))
+    return {
+        "company": row["company"], "counterparty": None,
+        "department": row["department"] or "Lainnya",
+        "scope": "project" if proj else "company",
+        "project": proj, "subfolder": row.get("subfolder") or "Umum",
+        "should_split": False,
+        "filename_out": Path(row["path"]).name,     # pertahankan nama asli arsip
+    }
+
+
+# Checkpoint di C: (BUKAN di D:) supaya catatan progres selamat kalau disk lepas.
+STATE_FILE = Path("archive_ingest_state.jsonl")
+
+
+def _file_quietly(pdf_path, analysis, index, lock):
+    """file_document tapi tahan output ramai-nya; kembalikan logs (atau entri error)."""
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            return P.file_document(Path(pdf_path), analysis, index, lock, canon_project=True)
+    except Exception as e:
+        return [{"source_file": Path(pdf_path).name, "status": "error",
+                 "error": str(e), "company": analysis.get("company")}]
+
+
+def _load_checkpoint(dest: Path):
+    """Kembalikan (logs_sebelumnya, set_source_path_yang_sudah_ok) dari run sebelumnya."""
+    logs, done = [], set()
+    if STATE_FILE.exists():
+        for line in STATE_FILE.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                e = json.loads(line)
+            except Exception:
+                continue                              # baris korup (crash di tengah) → abaikan
+            if e.get("_dest") != str(dest):
+                continue                              # checkpoint untuk dest lain
+            logs.append(e)
+            if e.get("status") == "ok" and e.get("source_path"):
+                done.add(e["source_path"])
+    return logs, done
+
+
+def reconcile_dest(dest: Path, logs: list, index: dict):
+    """Fase C: satukan nama proyek & subfolder kembar jadi kanonik, lalu pindahkan."""
+    entries = [l for l in logs if l.get("status") == "ok" and l.get("output_file")
+               and l.get("relpath") and Path(l["output_file"]).exists()]
+    if not entries:
+        return
+    projects, subfolders = R.build_inputs(entries)
+    print(f"\n  ▶ Fase C: rekonsiliasi {len(projects)} proyek + "
+          f"{sum(len(v) for v in subfolders.values())} subfolder (Claude)...")
+    proj_map, sub_map, proj_ok = P.reconcile_with_claude(projects, subfolders)
+    if not proj_ok:
+        print("    ⚠ Rekonsiliasi proyek gagal — struktur mentah dipertahankan.")
+        return
+
+    moved = 0
+    for e in entries:
+        comp = e.get("company") or P.UNIDENTIFIED
+        proj = P.normalize_project(e.get("project"))
+        dept = e.get("department") or "Lainnya"
+        sub  = e.get("subfolder") or "Umum"
+        kind = R.relpath_kind(e["relpath"])
+        new_comp, new_proj = comp, proj
+        if proj and (comp, proj) in proj_map:
+            new_comp, new_proj = proj_map[(comp, proj)]
+        new_proj = P.normalize_project(new_proj)
+        new_sub  = sub_map.get((dept, sub), sub)
+        if kind == "project" and not new_proj:
+            kind = "noproject" if dept in P.PROJECT_ONLY_DEPTS else "company"
+        rel = R.build_relpath(kind, dept, new_sub, new_proj)
+        old_path = Path(e["output_file"])
+        new_path = dest / P.sanitize(new_comp) / Path(rel) / old_path.name
+        if new_proj:
+            P.register_project(index, P.sanitize(new_comp), P.sanitize(new_proj))
+        P.register_subfolder(index, P.sanitize(new_comp), rel)
+        if old_path.resolve() != new_path.resolve():
+            new_path.parent.mkdir(parents=True, exist_ok=True)
+            d = P.unique_path(new_path)
+            shutil.move(str(old_path), str(d))
+            new_path = d
+            moved += 1
+        e["company"]   = P.sanitize(new_comp)
+        e["project"]   = P.sanitize(new_proj) if new_proj else None
+        e["subfolder"] = P.sanitize(new_sub)
+        e["relpath"]   = rel
+        e["output_file"] = str(new_path)
+
+    for d in sorted(dest.rglob("*"), key=lambda p: len(p.parts), reverse=True):
+        if d.is_dir() and not any(d.iterdir()):
+            d.rmdir()
+    print(f"    ✓ {moved} file dipindah ke struktur kanonik.")
+
+
+def apply_plan(root: Path, dest: Path, plan: list, workers: int, analyze_uncertain: bool,
+               reconcile: bool = True):
+    from threading import Event
+    P.OUTPUT_DIR = dest                              # arahkan filing ke folder rapi baru
+    fidx = dest / "folder_index.json"                # lanjutkan index lama biar konsisten
+    index = json.loads(fidx.read_text(encoding="utf-8")) if fidx.exists() else {}
+    lock, state_lock, abort = Lock(), Lock(), Event()
+
+    prev_logs, done = _load_checkpoint(dest)
+    logs = list(prev_logs)
+    sf = STATE_FILE.open("a", encoding="utf-8")       # append — checkpoint inkremental
+
+    def record(entries, src):
+        """Tandai source + dest, tulis ke checkpoint (C:) seketika, kumpulkan ke logs."""
+        with state_lock:
+            for e in entries:
+                e["source_path"], e["_dest"] = str(src), str(dest)
+                sf.write(json.dumps(e, ensure_ascii=False) + "\n")
+                logs.append(e)
+            sf.flush()
+
+    def alive():
+        if root.exists() and dest.parent.exists():
+            return True
+        abort.set()
+        return False
+
+    high = [r for r in plan if r["confidence"] == "HIGH" and r["path"] not in done]
+    unc  = [r for r in plan if r["confidence"] in ("MED", "LOW") and r["path"] not in done]
+    junk = [r for r in plan if r["confidence"] == "JUNK"]
+    skipped = len(done)
+    if skipped:
+        print(f"\n  ↻ Lanjut dari checkpoint: {skipped} file sudah beres → dilewati.")
+
+    # ── Fase A: HIGH — salin langsung dari path (gratis) ──────────────────────
+    print(f"\n  ▶ Fase A: {len(high)} file HIGH → salin langsung dari path (tanpa Claude)")
+    for i, r in enumerate(tqdm(high, desc="    nyalin", unit="f")):
+        if i % 200 == 0 and not alive():
+            break
+        record(_file_quietly(r["path"], analysis_from_path(r), index, lock), r["path"])
+
+    # ── Fase B: MED/LOW — analisis isi (berbayar) atau parkir ─────────────────
+    if not abort.is_set() and analyze_uncertain and unc:
+        print(f"\n  ▶ Fase B: {len(unc)} file ragu → analisis isi (Claude, paralel x{workers})")
+
+        def work(r):
+            if abort.is_set() or not root.exists():   # disk lepas → jangan bayar Claude
+                return None
+            rel = str(Path(r["path"]).relative_to(root))
+            res = P.analyze_pdf(r["path"], index, path_hint=rel)
+            if not res:                               # gagal baca → parkir pakai tebakan path
+                res = analysis_from_path(r)
+                res["department"] = r["department"] or "_Perlu Dicek"
+            elif r["company"] != P.UNIDENTIFIED:      # path punya perusahaan yakin → menang
+                res["company"] = r["company"]
+            return _file_quietly(r["path"], res, index, lock)
+
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futs = {ex.submit(work, r): r for r in unc}
+            for n, fu in enumerate(tqdm(as_completed(futs), total=len(futs),
+                                        desc="    analisis", unit="f")):
+                out = fu.result()
+                if out is not None:
+                    record(out, futs[fu]["path"])
+                if n % 100 == 0:
+                    alive()
+    elif not abort.is_set() and unc:                  # parkir tanpa Claude
+        print(f"\n  ▶ Fase B: {len(unc)} file ragu → parkir ke _Perlu Dicek (tanpa Claude)")
+        for i, r in enumerate(tqdm(unc, desc="    parkir", unit="f")):
+            if i % 200 == 0 and not alive():
+                break
+            a = analysis_from_path(r)
+            a["department"], a["scope"], a["project"] = "_Perlu Dicek", "company", None
+            record(_file_quietly(r["path"], a, index, lock), r["path"])
+
+    sf.close()
+
+    # ── Fase C: rekonsiliasi nama proyek/subfolder (hanya kalau run tuntas) ────
+    if reconcile and not abort.is_set():
+        try:
+            reconcile_dest(dest, logs, index)
+        except Exception as e:
+            print(f"    ⚠ Rekonsiliasi error: {e} — struktur mentah dipertahankan.")
+
+    # ── Tulis index + log final ke dest (best-effort — dest bisa hilang) ───────
+    try:
+        (dest / "folder_index.json").write_text(
+            json.dumps(index, ensure_ascii=False, indent=2), encoding="utf-8")
+        (dest / "archive_log.json").write_text(
+            json.dumps(logs, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+    ok  = sum(1 for l in logs if l.get("status") == "ok")
+    err = sum(1 for l in logs if l.get("status") == "error")
+    c = P.usage_cost()
+    print(f"\n{'='*70}")
+    if abort.is_set():
+        print(f"  ⚠  DISK TERPUTUS / tujuan hilang — dihentikan dengan aman.")
+        print(f"  💾 Progres tersimpan di checkpoint: {ok} file beres sejauh ini.")
+        print(f"  ↻  Sambungkan lagi disk D:, lalu JALANKAN ULANG command yang SAMA")
+        print(f"     untuk melanjutkan dari titik terakhir (tidak mengulang/bayar ulang).")
+    else:
+        print(f"  ✅ Selesai menata arsip (SALIN — file asli di {root} tidak disentuh)")
+        print(f"  📁 Hasil rapi : {dest.resolve()}")
+        print(f"  ℹ  Checkpoint disimpan ({STATE_FILE}); run ulang akan melewati yang sudah"
+              f" beres. Pakai --fresh kalau mau menata dari nol.")
+    print(f"  📄 Terfile    : {ok} dokumen  ({err} gagal, {len(junk)} junk dilewati)")
+    print(f"  💰 Biaya Claude: ${c['usd']:.2f} (≈ Rp {c['idr']:,.0f}), {c['calls']} panggilan")
+    print(f"{'='*70}\n")
+
+
+def dest_segments(row: dict):
+    """Path tujuan (di bawah folder perusahaan) untuk sebuah row — seperti saat apply."""
+    proj  = P.normalize_project(row.get("project"))
+    dept  = row.get("department") or "Lainnya"
+    scope = "project" if proj else "company"
+    base_rel, _, _ = P.placement_relpath(dept, scope, proj)
+    return row["company"], base_rel.split("/") + [row.get("subfolder") or "Umum"]
+
+
+def print_dest_tree(plan: list, max_depth: int = 3, width: int = 12):
+    """Cetak pratinjau pohon folder hasil (perusahaan → ... ) dengan jumlah file."""
+    rootnode = {"n": 0, "ch": {}}
+    for r in plan:
+        if r["confidence"] == "JUNK":
+            continue
+        company, segs = dest_segments(r)
+        cur = rootnode
+        for name in [company] + segs:
+            cur = cur["ch"].setdefault(name, {"n": 0, "ch": {}})
+            cur["n"] += 1
+
+    def show(node, name, indent, depth):
+        print(f"    {indent}{name}  [{node['n']}]")
+        if depth <= 1 or not node["ch"]:
+            return
+        kids = sorted(node["ch"].items(), key=lambda kv: -kv[1]["n"])
+        for k, v in kids[:width]:
+            show(v, k, indent + "  ", depth - 1)
+        if len(kids) > width:
+            print(f"    {indent}  … (+{len(kids)-width} folder lagi)")
+
+    print(f"\n  ── Pratinjau pohon folder hasil (perusahaan → dept/proyek → subfolder) ──")
+    for comp, node in sorted(rootnode["ch"].items(), key=lambda kv: -kv[1]["n"]):
+        show(node, comp, "", max_depth)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", default="D:\\")
     ap.add_argument("--only", default=None, help="batasi ke satu folder top-level")
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--out", default="archive_plan.jsonl")
+    ap.add_argument("--tree-depth", type=int, default=3, help="kedalaman pratinjau pohon")
+    ap.add_argument("--tree-width", type=int, default=12, help="maks anak per node di pohon")
+    ap.add_argument("--apply", action="store_true",
+                    help="benar-benar menata file (SALIN ke --dest). Tanpa ini = preview saja.")
+    ap.add_argument("--dest", default="D:\\Arsip_Rapih",
+                    help="folder tujuan hasil rapi (default D:\\Arsip_Rapih)")
+    ap.add_argument("--workers", type=int, default=10)
+    ap.add_argument("--no-analyze", action="store_true",
+                    help="jangan analisis isi file ragu (parkir ke _Perlu Dicek, gratis)")
+    ap.add_argument("--no-reconcile", action="store_true",
+                    help="lewati Fase C (penyatuan nama proyek/subfolder kembar)")
+    ap.add_argument("--yes", action="store_true", help="lewati konfirmasi y/n")
+    ap.add_argument("--fresh", action="store_true",
+                    help="abaikan checkpoint & mulai menata dari nol")
     args = ap.parse_args()
 
+    if args.fresh and STATE_FILE.exists():
+        STATE_FILE.unlink()
+
     root = Path(args.root)
-    print(f"\n{'='*70}\n  DRY-RUN Ingest Arsip (read-only)  —  root: {root}")
+    mode = "APPLY (SALIN)" if args.apply else "DRY-RUN (read-only)"
+    print(f"\n{'='*70}\n  Ingest Arsip — {mode}  —  root: {root}")
     if args.only:
         print(f"  Hanya: {args.only}")
     print(f"{'='*70}\n  Menyusuri folder... (tanpa baca isi PDF, tanpa Claude)\n")
@@ -299,6 +577,11 @@ def main():
     for comp, v in per_company.most_common():
         print(f"    {v:6d}  {comp}")
 
+    print_dest_tree(plan, max_depth=args.tree_depth, width=args.tree_width)
+    unc_n = per_conf.get("MED", 0) + per_conf.get("LOW", 0)
+    print(f"\n  ⓘ ~{unc_n} file MED/LOW posisinya TENTATIF di pohon ini — dept/proyeknya"
+          f" bisa berubah setelah analisis isi saat --apply.")
+
     print(f"\n  ── 25 token folder TAK dikenali tersering (buat perkaya kosakata) ──")
     for tok, v in unknown.most_common(25):
         print(f"    {v:5d}  {tok}")
@@ -306,7 +589,31 @@ def main():
     Path(args.out).write_text(
         "\n".join(json.dumps(p, ensure_ascii=False) for p in plan), encoding="utf-8")
     print(f"\n  📝 Rincian per file → {args.out}  ({len(plan)} baris)")
-    print(f"{'='*70}\n  (read-only — tidak ada file yang dipindah)\n")
+
+    if not args.apply:
+        print(f"{'='*70}\n  (read-only — tidak ada file yang dipindah)")
+        print(f"  Untuk benar-benar menata: tambah --apply  (akan SALIN ke {args.dest})\n")
+        return
+
+    # ── Mode APPLY: konfirmasi dulu, baru tata ────────────────────────────────
+    dest = Path(args.dest)
+    unc = per_conf.get("MED", 0) + per_conf.get("LOW", 0)
+    est_usd = (0 if args.no_analyze else unc * 0.0124)
+    print(f"\n{'='*70}\n  ⚠  MODE APPLY — akan MENYALIN file ke: {dest}")
+    print(f"  • {per_conf.get('HIGH',0)} file HIGH  → salin langsung dari path (gratis)")
+    print(f"  • {unc} file ragu       → " +
+          ("PARKIR ke _Perlu Dicek (gratis)" if args.no_analyze
+           else f"analisis isi via Claude (≈ ${est_usd:.2f})"))
+    print(f"  • {per_conf.get('JUNK',0)} file junk  → dilewati")
+    if not args.no_reconcile:
+        print(f"  • Fase C: rekonsiliasi nama proyek/subfolder kembar (Claude, ≈ $0.10–0.30)")
+    print(f"  • File asli di {root} TIDAK disentuh (ini operasi SALIN).")
+    print(f"{'─'*70}")
+    if not args.yes and input("  Lanjutkan menata (salin) file? (y/n): ").strip().lower() != "y":
+        print("\n  ❌ Dibatalkan.\n")
+        return
+    apply_plan(root, dest, plan, args.workers, analyze_uncertain=not args.no_analyze,
+               reconcile=not args.no_reconcile)
 
 
 if __name__ == "__main__":

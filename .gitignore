@@ -20,3 +20,6 @@ __pycache__/
 .venv/
 venv/
 archive_plan.jsonl
+_test_dest/
+archive_ingest_state.jsonl
+Arsip_Rapih/
