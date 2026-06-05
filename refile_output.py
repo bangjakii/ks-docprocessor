@@ -33,24 +33,11 @@ def build_inputs(entries: list):
     return projects, subfolders
 
 
-def relpath_kind(relpath: str) -> str:
-    """Tentukan jenis penempatan dari relpath lama."""
-    head = relpath.split("/", 1)[0]
-    if head == P.PROJECTS_FOLDER:
-        return "project"
-    if head == P.NO_PROJECT_FOLDER:
-        return "noproject"
-    return "company"
-
-
-def build_relpath(kind: str, dept: str, sub: str, proj: str) -> str:
-    dept = P.sanitize(dept or "Lainnya")
-    sub  = P.sanitize(sub or "Umum")
-    if kind == "project":
-        return f"{P.PROJECTS_FOLDER}/{P.sanitize(proj)}/{dept}/{sub}"
-    if kind == "noproject":
-        return f"{P.NO_PROJECT_FOLDER}/{dept}/{sub}"
-    return f"{dept}/{sub}"
+def build_relpath(dept: str, sub: str, proj: str) -> str:
+    """Relpath baru dari (dept, subfolder, proyek) — pakai aturan Korporat/Proyek di process_docs."""
+    base, _, _ = P.placement_relpath(dept, "proyek" if proj else "korporat", proj)
+    sub = "/".join(s for s in (P.sanitize(x) for x in str(sub or "Umum").split("/")) if s) or "Umum"
+    return f"{base}/{sub}"
 
 
 def main():
@@ -93,7 +80,6 @@ def main():
         proj = P.normalize_project(e.get("project"))   # placeholder ("00_Unidentified") → None
         dept = e.get("department") or "Lainnya"
         sub  = e.get("subfolder") or "Umum"
-        kind = relpath_kind(e["relpath"])
 
         new_comp, new_proj = comp, proj
         if proj and (comp, proj) in proj_map:
@@ -101,12 +87,7 @@ def main():
         new_proj = P.normalize_project(new_proj)   # rekonsiliasi bisa balikin placeholder juga
         new_sub = sub_map.get((dept, sub), sub)
 
-        # Proyek jadi placeholder/null tapi relpath lama "project" → tentukan ulang seperti
-        # placement_relpath: Engineering/Operasional/HR → _Tanpa Proyek; sisanya → level perusahaan.
-        if kind == "project" and not new_proj:
-            kind = "noproject" if dept in P.PROJECT_ONLY_DEPTS else "company"
-
-        rel      = build_relpath(kind, dept, new_sub, new_proj)
+        rel      = build_relpath(dept, new_sub, new_proj)   # aturan Korporat/Proyek
         old_path = Path(e["output_file"])
         new_path = P.OUTPUT_DIR / P.sanitize(new_comp) / Path(rel) / old_path.name
         plan.append((i, old_path, new_path, P.sanitize(new_comp),

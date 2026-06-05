@@ -59,45 +59,71 @@ try:
 except ImportError:                       # fallback tanpa progress bar
     def tqdm(x=None, **k): return x if x is not None else iter(())
 
-# ── Top-level yang dilewati (sistem / bukan dokumen) ──────────────────────────
+# ── Top-level yang dilewati (sistem / bukan dokumen / hasil tool sendiri) ─────
+# PENTING: "Arsip_Rapih" = folder TUJUAN; jangan pernah men-scan output sendiri
+# (kalau tidak, hasil run lama ke-scan ulang → angka & klasifikasi ngaco).
 SKIP_TOP = {
     "$RECYCLE.BIN", "System Volume Information", "found.000", "autorun.inf",
+    "Arsip_Rapih", "_Arsip_Rapih", "Arsip Rapih",
 }
 
-# ── Kosakata departemen: substring (sudah dinormalisasi) → departemen kanonik ──
-# Dicek terurut; yang pertama cocok menang. Spesifik dulu, umum belakangan.
-DEPT_KEYWORDS = [
-    # HR sebelum Legal: "sertifikat keahlian / tenaga ahli" jangan ketabrak "sertifikat"→Legal.
-    ("HR",               ["sdm", "personil", "personalia", "tenaga kerja", "tenaga ahli",
-                           "karyawan", "idcard", "id card", "absensi", "gaji",
-                           "kepegawaian", "curriculum", " cv ", "ijazah", "keahlian",
-                           "daftar tenaga", "biodata", "ktp direksi", "skck"]),
-    ("Legal",            ["legalitas", "legal", "perizinan", "perijinan", "izin usaha",
-                           "ijin", "akte", "akta", "npwp", "siup", "situ", " tdp",
-                           "domisili", "hukum", "sertifikat", "certificate", " cert",
-                           "perjanjian", "kbli", "nib", "pengesahan", "notaris",
-                           "tanah", "imb", " ho ", "amdal", "license", "lisensi", "pelepasan"]),
-    ("Finance",          ["keuangan", "finance", "pajak", "tagihan", "invoice", "faktur",
-                           "termin", " bank", "anggaran", "pembayaran", "kwitansi",
-                           "rekening", "cash", "biaya", "budget", "rab", "harga"]),
-    ("Sales & Marketing",["marketing", "maketing", "tender", "lelang", "penawaran",
-                           "penaawaran", "pemasaran", "proposal", "prakualifikasi",
-                           "kualifikasi", "lpse", "kontrak", "company profile", "profile",
-                           "profil", "brosur", "presentasi", "presentation", "sampul",
-                           "quotation", " bid ", "spk", "spal"]),
-    ("Engineering",      ["engineering", "teknik", "teknis", "desain", "design", "gambar",
-                           "drawing", "rancangan", "rancang", "spesifikasi", "spec",
-                           "network planning", "general arrangement", "key plan",
-                           "ships particular", "principal dimension", "piping",
-                           "architecture", "cable", "laying", "fmea", "machinery",
-                           "hull", "outfitting", "welding", "blasting", "painting",
-                           "ballast", "bilge", "propulsion", "hydraulic", "electric",
-                           "calculation", "stability", "manual", "lines plan", "midship"]),
-    ("Operasional",      ["operasional", "operasi", "logistic", "logistik", "gudang",
-                           "produksi", " spb", "pengadaan", "purchasing", "material",
-                           "bongkaran", "laporan plate", "kawat las", "sewa", "rekanan",
-                           "po ", "berita acara", "delivery", "pengiriman", "stock"]),
-    ("IT",               ["website", " web ", "lpse akun", "akun lpse"]),
+# ── JENIS DOKUMEN → (departemen, subfolder kanonik) ───────────────────────────
+# Satu match menentukan DEPARTEMEN + nama SUBFOLDER bersih (jenis dokumen). Subfolder
+# BUKAN nama item/alat (Bow Thruster) — item/vendor itu metadata. Dicek per-segmen
+# (dalam→dangkal); URUTAN = prioritas (spesifik & tak-ambigu dulu).
+DOCTYPE_RULES = [
+    # (keywords, department, subfolder_kanonik)
+    # — HR (spesifik dulu supaya "sertifikat keahlian/keamanan" tak ketabrak sertifikat lain) —
+    (["tenaga ahli", "tenaga teknis", "tenaga kerja", "daftar tenaga", "curriculum vitae",
+      "riwayat hidup", "biodata"],                          "HR", "Tenaga Ahli"),
+    (["sertifikat keahlian", "sertifikat keamanan", "sertifikasi keamanan",
+      "sertifikat keselamatan", "keselamatan kerja", " k3 ", "ijazah"], "HR", "Sertifikasi Personil"),
+    (["sdm", "personil", "personalia", "kepegawaian", "karyawan", "pegawai", "ktp direksi",
+      "skck", "gaji", "absensi"],                           "HR", "Kepegawaian"),
+    # — Finance —
+    (["invoice", "tagihan"],                                "Finance", "Invoice"),
+    (["faktur", "pajak"],                                   "Finance", "Faktur & Pajak"),
+    (["purchase order", " po ", "po-", "pesanan pembelian", "pesanan pembelan"], "Finance", "Purchase Order"),
+    (["bank garansi", "garansi bank"],                      "Finance", "Bank Garansi"),
+    (["memo pembayaran", "permohonan pembayaran", "pembayaran", "pelunasan", "kwitansi", "termin"],
+                                                            "Finance", "Pembayaran"),
+    (["laporan keuangan", "lapkeu", "neraca", "cash flow", "arus kas", "anggaran", " rab ",
+      "rekening", " aset", "asset"],                        "Finance", "Laporan Keuangan & Aset"),
+    # — Sales —
+    (["penawaran", "penaawaran", "harga", "quotation", "spph"], "Sales", "Penawaran Harga"),
+    (["tender", "lelang", "prakualifikasi", "kualifikasi", "sampul", "lpse", "rks", " bid "],
+                                                            "Sales", "Tender"),
+    # — Engineering (termasuk sertifikat material/alat) —
+    (["gambar teknik", "gambar", "drawing", "general arrangement", " ga ", "key plan",
+      "lines plan", "midship"],                             "Engineering", "Gambar"),
+    (["spesifikasi", "spesifikasi teknis", " spek", "calculation", "perhitungan",
+      "network planning", "ships particular", "principal dimension"], "Engineering", "Spesifikasi & Perhitungan"),
+    (["mill certificate", "material certificate", "class certificate", "type approval",
+      "sertifikat material", "sertifikat bahan", " bki ", "certificate", "sertifikat"],
+                                                            "Engineering", "Sertifikat Material"),
+    (["rancangan", "desain", "design", "piping", "machinery", "hull", "outfitting", "fmea",
+      "teknis", "teknik"],                                  "Engineering", "Teknis"),
+    # — Operasional —
+    (["bast", "berita acara", "serah terima"],              "Operasional", "BAST"),
+    (["jadwal", "kalender", "time schedule", "kurva s"],    "Operasional", "Jadwal"),
+    (["vendor", "supplier", "rekanan"],                     "Operasional", "Vendor"),
+    (["pengadaan", "material", "logistik", "logistic", " spb", "pengiriman", "delivery",
+      "gudang", "bongkaran", "mobilisasi", " stock", "persiapan pembangunan", "produksi"],
+                                                            "Operasional", "Pengadaan"),
+    # — Marketing — ("marketing"/"maketing" DIBUANG: cocok folder "MAKETING TENDER" → tender
+    #   salah jadi Marketing. Pakai frasa spesifik dokumen marketing saja.)
+    (["company profile", "profil perusahaan", "brosur", "presentasi perusahaan",
+      "katalog perusahaan", "profil singkat perusahaan"], "Marketing", "Company Profile"),
+    # — Legal (dokumen badan usaha) —
+    (["akta", "akte", "notaris", "pengesahan"],             "Legal", "Akta"),
+    (["nib", "siup", "situ", " tdp", "izin usaha", "perizinan", "perijinan", "ijin", "kbli",
+      "domisili", "amdal", "imb", " ho ", "lisensi", "license"], "Legal", "Legalitas & Izin"),
+    (["kontrak", "perjanjian", "mou"],                      "Legal", "Kontrak"),
+    (["sertifikat tanah", "tanah", "pelepasan"],            "Legal", "Tanah"),
+    (["npwp"],                                              "Legal", "NPWP"),
+    (["legalitas", "legal", "hukum"],                       "Legal", "Legalitas & Izin"),
+    # — IT —
+    (["website", " web ", "aplikasi", "software", "sistem informasi"], "IT", "Sistem & Aplikasi"),
 ]
 
 # ── Proyek KANONIK ────────────────────────────────────────────────────────────
@@ -235,14 +261,60 @@ def company_from_path(segments: list) -> tuple:
     return P.UNIDENTIFIED, None
 
 
-def dept_from_path(segments: list) -> tuple:
-    """Departemen kanonik pertama yang cocok (dalam→dangkal). Return (dept_or_None, seg)."""
+def classify_doctype(segments: list):
+    """
+    Tebak (departemen, subfolder-kanonik, segmen-pemicu) dari JENIS dokumen di path
+    (dalam→dangkal, prioritas DOCTYPE_RULES). Tak cocok → (None, None, None).
+    """
     for seg in reversed(segments):
         n = f" {norm(seg)} "
-        for dept, kws in DEPT_KEYWORDS:
+        for kws, dept, sub in DOCTYPE_RULES:
             if any(k in n for k in kws):
-                return dept, seg
-    return None, None
+                return dept, sub, seg
+    return None, None, None
+
+
+# Penanda konteks PENGADAAN — dipakai untuk mengelompokkan subfolder per ITEM (Plat Baja,
+# Pompa) supaya tiap departemen tetap terkelompok per item. (Dept TETAP per jenis dokumen.)
+PROCUREMENT_MARKERS = ["pengadaan", "purchasing", " material ", "pesanan pembelian",
+                       "pembelian", "vendor", "supplier"]
+
+def _strip_num(s: str) -> str:
+    """Buang penomoran depan: '1. ', 'II. ', 'A. ' → sisa nama."""
+    return re.sub(r"^\s*([ivxlcdm]+|[a-z]|\d+)[\.\)]\s+", "", s, flags=re.I).strip()
+
+
+_VENDOR_RE = re.compile(r"^(pt|cv|ud|pd|fa|toko|koperasi|kop)[\.\s]", re.I)
+
+def detect_vendor(segments: list):
+    """Nama VENDOR (pihak luar) dari path — segmen ber-prefix PT/CV/UD/dll yang BUKAN
+    perusahaan grup. Dalam→dangkal (vendor biasanya lebih dalam). None kalau tak ada."""
+    for seg in reversed(segments):
+        s = _strip_num(seg)
+        if _VENDOR_RE.match(s) and company_from_path([seg])[0] == P.UNIDENTIFIED:
+            return s
+    return None
+
+
+def procurement_item(segments: list):
+    """
+    Kalau path konteks PENGADAAN, kembalikan nama ITEM-nya (folder setelah wrapper
+    pengadaan/material/proyek) supaya semua dok item dikumpulkan di Operasional/<Item>.
+    Return: nama item (str), atau "" kalau pengadaan tapi item tak jelas, atau None kalau
+    bukan konteks pengadaan.
+    """
+    blob = " " + " ".join(norm(s) for s in segments) + " "
+    if not any(m in blob for m in PROCUREMENT_MARKERS):
+        return None
+    start = 0
+    for i, s in enumerate(segments):
+        n = f" {norm(s)} "
+        if (" pengadaan " in n or " material " in n or " purchasing " in n
+                or "pengadaan" in norm(s) or project_from_path([s])[0]):
+            start = i + 1
+    if 0 < start < len(segments):
+        return _strip_num(segments[start])     # ITEM = folder pertama setelah wrapper
+    return ""
 
 
 def project_from_path(segments: list, *_) -> tuple:
@@ -296,13 +368,24 @@ def analyze(root: Path, only: str = None, limit: int = None):
                 stem = Path(f).stem
 
                 company, cseg = company_from_path(segments)
-                dept, dseg = dept_from_path(segments + [stem])
                 project, _ = project_from_path(segments)      # folder saja, BUKAN nama file
+                # Departemen + subfolder KANONIK (jenis dokumen) dari path/nama file.
+                dept, doc_sub, dseg = classify_doctype(segments + [stem])
+                subfolder = doc_sub or (segments[-1] if segments else "Umum")
+                # OPERASIONAL diorganisir per VENDOR (item di bawah vendor) sesuai taxonomy;
+                # kalau tak ada vendor → kelompokkan per ITEM; BAST/Jadwal tetap jenis dokumen.
+                if dept == "Operasional":
+                    vendor = detect_vendor(segments)
+                    item   = procurement_item(segments)
+                    if vendor:
+                        subfolder = f"{vendor}/{item}" if item else vendor
+                    elif doc_sub == "Pengadaan" and item:
+                        subfolder = item
 
                 plan.append({
                     "path": str(full), "top": top, "segments": segments[1:],
                     "company": company, "department": dept, "project": project,
-                    "subfolder": segments[-1] if segments else "Umum",
+                    "subfolder": subfolder,
                     "junk": is_junk(segments), "src": "path", "cseg": cseg, "dseg": dseg,
                 })
             if limit and n_seen >= limit:
@@ -402,15 +485,15 @@ def _load_checkpoint(dest: Path):
 
 
 def reconcile_dest(dest: Path, logs: list, index: dict):
-    """Fase C: satukan nama proyek & subfolder kembar jadi kanonik, lalu pindahkan."""
+    """Fase C: satukan nama PROYEK kembar, lalu pindahkan. Subfolder TIDAK direkonsiliasi —
+    sudah kanonik dari classify_doctype, kalau di-rename Claude malah jadi salah."""
     entries = [l for l in logs if l.get("status") == "ok" and l.get("output_file")
                and l.get("relpath") and Path(l["output_file"]).exists()]
     if not entries:
         return
-    projects, subfolders = R.build_inputs(entries)
-    print(f"\n  ▶ Fase C: rekonsiliasi {len(projects)} proyek + "
-          f"{sum(len(v) for v in subfolders.values())} subfolder (Claude)...")
-    proj_map, sub_map, proj_ok = P.reconcile_with_claude(projects, subfolders)
+    projects, _ = R.build_inputs(entries)
+    print(f"\n  ▶ Fase C: rekonsiliasi {len(projects)} nama proyek (Claude)...")
+    proj_map, sub_map, proj_ok = P.reconcile_with_claude(projects, {})   # {} = skip subfolder
     if not proj_ok:
         print("    ⚠ Rekonsiliasi proyek gagal — struktur mentah dipertahankan.")
         return
@@ -421,19 +504,18 @@ def reconcile_dest(dest: Path, logs: list, index: dict):
         proj = P.normalize_project(e.get("project"))
         dept = e.get("department") or "Lainnya"
         sub  = e.get("subfolder") or "Umum"
-        kind = R.relpath_kind(e["relpath"])
         new_comp, new_proj = comp, proj
         if proj and (comp, proj) in proj_map:
             new_comp, new_proj = proj_map[(comp, proj)]
         new_proj = P.normalize_project(new_proj)
         new_sub  = sub_map.get((dept, sub), sub)
-        if kind == "project" and not new_proj:
-            kind = "noproject" if dept in P.PROJECT_ONLY_DEPTS else "company"
-        rel = R.build_relpath(kind, dept, new_sub, new_proj)
+        rel = R.build_relpath(dept, new_sub, new_proj)        # aturan Korporat/Proyek
         old_path = Path(e["output_file"])
         new_path = dest / P.sanitize(new_comp) / Path(rel) / old_path.name
-        if new_proj:
-            P.register_project(index, P.sanitize(new_comp), P.sanitize(new_proj))
+        # daftar folder proyek hanya kalau dokumen benar2 ditaruh di cabang Proyek
+        _, _kind, _pf = P.placement_relpath(dept, "proyek" if new_proj else "korporat", new_proj)
+        if _pf:
+            P.register_project(index, P.sanitize(new_comp), P.sanitize(_pf))
         P.register_subfolder(index, P.sanitize(new_comp), rel)
         if old_path.resolve() != new_path.resolve():
             new_path.parent.mkdir(parents=True, exist_ok=True)
@@ -506,6 +588,8 @@ def apply_plan(root: Path, dest: Path, plan: list, workers: int, analyze_uncerta
             keep = []
             for r in tqdm(prone, desc="    cek-hlm", unit="f"):
                 (split_check if _page_count_quiet(r["path"]) >= SPLIT_MIN_PAGES else keep).append(r)
+            for r in split_check:
+                r["_splitcheck"] = True       # HIGH → klasifikasi path tetap acuan kalau tak dipecah
             prone_set = {id(r) for r in prone}
             high = [r for r in high if id(r) not in prone_set] + keep
             print(f"    → {len(split_check)} bundel kandidat dialihkan ke analisis-isi (bisa dipecah).")
@@ -538,6 +622,8 @@ def apply_plan(root: Path, dest: Path, plan: list, workers: int, analyze_uncerta
             if not res:                               # gagal baca → parkir pakai tebakan path
                 res = analysis_from_path(r)
                 res["department"] = r["department"] or "_Perlu Dicek"
+            elif r.get("_splitcheck") and not res.get("should_split"):
+                res = analysis_from_path(r)           # HIGH & ternyata BUKAN bundel → percaya path
             elif r["company"] != P.UNIDENTIFIED:      # path punya perusahaan yakin → menang
                 res["company"] = r["company"]
             return _file_quietly(r["path"], res, index, lock)
@@ -664,6 +750,13 @@ def main():
         STATE_FILE.unlink()
 
     root = Path(args.root)
+    # Jangan pernah scan folder TUJUAN (kalau ada di bawah root) — hindari scan output sendiri.
+    try:
+        dpath = Path(args.dest).resolve()
+        if dpath.parent == root.resolve():
+            SKIP_TOP.add(dpath.name)
+    except Exception:
+        pass
     mode = "APPLY (SALIN)" if args.apply else "DRY-RUN (read-only)"
     print(f"\n{'='*70}\n  Ingest Arsip — {mode}  —  root: {root}")
     if args.only:

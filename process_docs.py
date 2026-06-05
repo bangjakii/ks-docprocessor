@@ -96,7 +96,7 @@ COMPANY_ALIASES = {
     "kodja bahari":                      "KSO DKB-KS",
 }
 
-DEPARTMENTS = ["Legal", "Finance", "Sales & Marketing", "HR", "Engineering", "Operasional", "IT"]
+DEPARTMENTS = ["Legal", "Marketing", "Finance", "HR", "Sales", "Operasional", "Engineering", "IT"]
 
 client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
@@ -160,14 +160,19 @@ def canonicalize_company(name: str, unresolved: list = None) -> str:
     return UNIDENTIFIED
 
 
-# ── Penempatan: company-level vs project-level ────────────────────────────────
-# Legal & Sales/Marketing selalu di level perusahaan (di luar proyek).
-# Engineering/Operasional/HR selalu di dalam proyek (kalau tak ada proyek → _Tanpa Proyek).
-# Finance & IT: ikut "scope" yang ditentukan AI (company atau project).
-COMPANY_LEVEL_DEPTS = {"Legal", "Sales & Marketing"}
-PROJECT_ONLY_DEPTS  = {"Engineering", "Operasional", "HR"}
-PROJECTS_FOLDER     = "Projects"
-NO_PROJECT_FOLDER   = "_Tanpa Proyek"   # nama beda dari 00_Unidentified (company) — hindari tumpang tindih
+# ── Penempatan: cabang KORPORAT vs PROYEK ─────────────────────────────────────
+# Struktur: [Perusahaan]/Korporat/[Dept]  atau  [Perusahaan]/Proyek/[Proyek]/[Dept]
+# Korporat (level perusahaan): Legal, Marketing, Finance, HR.
+# Proyek  (per proyek)       : Sales, Operasional, Engineering, HR.
+# HR ada di dua-duanya: kalau ada proyek → Proyek/HR, kalau tidak → Korporat/HR.
+# Finance SELALU Korporat (keuangan proyek pun ke sini; proyek disimpan sbg metadata).
+KORPORAT_FOLDER   = "Korporat"
+PROYEK_FOLDER     = "Proyek"
+NO_PROJECT_FOLDER = "_Tanpa Proyek"
+KORPORAT_DEPTS    = {"Legal", "Marketing", "Finance"}      # selalu Korporat
+PROYEK_DEPTS      = {"Sales", "Operasional", "Engineering"} # selalu Proyek (butuh proyek)
+# (kompat lama — sebagian kode/test masih merujuk nama ini)
+PROJECTS_FOLDER     = PROYEK_FOLDER
 
 # Nilai "proyek" yang sebenarnya BUKAN proyek (AI kadang isi string ini, bukan null).
 # Dianggap = tak ada proyek → masuk _Tanpa Proyek, bukan jadi folder proyek sendiri.
@@ -189,20 +194,22 @@ def normalize_project(name) -> str | None:
 def placement_relpath(department: str, scope: str, project: str):
     """
     Tentukan path relatif (di bawah folder perusahaan) untuk sebuah dokumen.
-    Return (base_relpath, kind, project_final). kind ∈ {company, project, unidentified}.
+    Return (base_relpath, kind, project_final). kind ∈ {korporat, proyek}.
+    project_final = nama proyek HANYA kalau dokumen ditaruh di folder proyek (untuk daftar
+    folder proyek). Metadata proyek dokumen tetap disimpan terpisah oleh resolve_destination.
     """
     dept = department or "Lainnya"
     project = normalize_project(project)   # placeholder ("00_Unidentified" dll) → None
-    if dept in COMPANY_LEVEL_DEPTS:
-        return dept, "company", None
-    if dept in PROJECT_ONLY_DEPTS:
+    if dept in KORPORAT_DEPTS:
+        return f"{KORPORAT_FOLDER}/{dept}", "korporat", None
+    if dept in PROYEK_DEPTS or dept == "HR":
         if project:
-            return f"{PROJECTS_FOLDER}/{project}/{dept}", "project", project
-        return f"{NO_PROJECT_FOLDER}/{dept}", "unidentified", None
-    # Finance, IT, atau departemen tak dikenal → AI yang menentukan scope
-    if scope == "project" and project:
-        return f"{PROJECTS_FOLDER}/{project}/{dept}", "project", project
-    return dept, "company", None
+            return f"{PROYEK_FOLDER}/{project}/{dept}", "proyek", project
+        if dept == "HR":
+            return f"{KORPORAT_FOLDER}/HR", "korporat", None   # HR tanpa proyek → Korporat
+        return f"{PROYEK_FOLDER}/{NO_PROJECT_FOLDER}/{dept}", "proyek", None
+    # IT atau departemen tak dikenal → Korporat
+    return f"{KORPORAT_FOLDER}/{dept}", "korporat", None
 
 
 # ── Folder index (memory antar run) ──────────────────────────────────────────
@@ -593,16 +600,19 @@ SINGKATAN / NAMA LAIN (petakan ke nama resmi di atas):
 - "DKB" / "Dok Kodja Bahari" / "PT Dok dan Perkapalan Kodja Bahari" (segala ejaan, &, (Persero)) → KSO DKB-KS
   (DKB BUKAN perusahaan grup tersendiri — dia partner JV di KSO DKB-KS)
 
-DEPARTEMEN YANG TERSEDIA:
-{chr(10).join(f"- {d}" for d in DEPARTMENTS)}
-
-STRUKTUR FILING (PENTING):
-- Legal, Sales & Marketing → SELALU level perusahaan (tidak terkait proyek). scope="company", project=null.
-- Engineering, Operasional, HR → SELALU di dalam sebuah PROYEK. scope="project" + isi "project".
-  Kalau proyeknya tidak bisa diidentifikasi, biarkan project=null (otomatis masuk 00_Unidentified).
-- Finance, IT → bisa dua-duanya:
-  • Dokumen umum perusahaan (laporan keuangan tahunan, pajak perusahaan, kebijakan IT) → scope="company".
-  • Dokumen terkait proyek tertentu (invoice proyek, pembayaran termin) → scope="project" + isi "project".
+STRUKTUR FILING — dua cabang: KORPORAT (level perusahaan) & PROYEK (per proyek):
+- KORPORAT (scope="korporat"):
+  • Legal — akta pendirian, NIB, izin/perizinan, SIUP/TDP/SITU, domisili, sertifikat perusahaan, kontrak/perjanjian
+  • Marketing — company profile, brosur, presentasi perusahaan
+  • Finance — laporan keuangan, INVOICE, PO (purchase order), bank garansi, aset, pajak, faktur, tagihan, kwitansi.
+    (Keuangan proyek TETAP Finance/Korporat — TAPI tetap isi "project" sebagai metadata kalau dokumennya milik proyek.)
+- PROYEK (scope="proyek", WAJIB isi "project"):
+  • Sales — penawaran harga, dokumen tender, prakualifikasi, sampul penawaran, lelang
+  • Operasional — vendor, BAST, jadwal/kalender pengerjaan, pengadaan/material, logistik, SPB
+  • Engineering — gambar teknik, GA, drawing, spesifikasi, calculation, network planning
+- HR (dua-duanya): CV, tenaga ahli, sertifikasi keamanan/keahlian, data pegawai.
+  → kalau jelas untuk proyek tertentu (tenaga ahli proyek X) isi "project"; kalau pegawai umum, project=null.
+Kalau departemen PROYEK tapi proyek tak teridentifikasi → biarkan project=null.
 
 PROYEK & SUBFOLDER YANG SUDAH ADA (pakai ulang kalau cocok — JANGAN bikin ejaan baru untuk hal yang sama):
 {existing}
@@ -618,7 +628,7 @@ ATURAN:
    - Dokumen antara perusahaan grup ↔ pihak luar → "company" = perusahaan grup, "counterparty" = pihak luar.
    - Dokumen antara DUA perusahaan grup (mis. PT Krakatau Shipyard ↔ DKB) → "company" = "KSO DKB-KS".
    - Tidak ada perusahaan grup yang jelas → "company" = "00_Unidentified".
-3. Tentukan "department", "scope" ("company"/"project"), dan "project" sesuai STRUKTUR FILING di atas.
+3. Tentukan "department", "scope" ("korporat"/"proyek"), dan "project" sesuai STRUKTUR FILING di atas.
 4. "project": nama proyek singkat & konsisten. Kalau ada di daftar proyek yang sudah ada, PAKAI ULANG persis. Kalau bukan proyek → null.
 5. JANGAN potong: company profile, proposal, laporan tahunan, presentasi, manual, SOP, brosur, atau dokumen yang judulnya jelas satu topik.
 6. BOLEH dipotong: file yang jelas berisi campuran dokumen berbeda (invoice+faktur+bank garansi, kontrak+BAST+referensi berbeda proyek, dll).
@@ -628,13 +638,13 @@ ATURAN:
 Balas HANYA JSON, tanpa penjelasan, tanpa backtick.
 
 Format kalau TIDAK dipotong (contoh dokumen proyek):
-{{"company":"PT Krakatau Shipyard","counterparty":"PT Pertamina","department":"Engineering","scope":"project","project":"Pembangunan 2 Tug Boat 2024","subfolder":"Gambar Teknik","should_split":false,"filename_out":"General Arrangement TB-01.pdf","expire_date":null,"doc_number":null,"reason":"Gambar teknik proyek tug boat"}}
+{{"company":"PT Krakatau Shipyard","counterparty":"PT Pertamina","department":"Engineering","scope":"proyek","project":"Pembangunan 2 Tug Boat 2024","subfolder":"Gambar Teknik","should_split":false,"filename_out":"General Arrangement TB-01.pdf","expire_date":null,"doc_number":null,"reason":"Gambar teknik proyek tug boat"}}
 
-Format kalau TIDAK dipotong (contoh dokumen perusahaan):
-{{"company":"PT Krakatau Shipyard","counterparty":null,"department":"Legal","scope":"company","project":null,"subfolder":"Akta","should_split":false,"filename_out":"Akta Pendirian PT KS No.12 2010.pdf","expire_date":null,"doc_number":null,"reason":"Akta notaris — dokumen utuh"}}
+Format kalau TIDAK dipotong (contoh dokumen korporat):
+{{"company":"PT Krakatau Shipyard","counterparty":null,"department":"Legal","scope":"korporat","project":null,"subfolder":"Akta","should_split":false,"filename_out":"Akta Pendirian PT KS No.12 2010.pdf","expire_date":null,"doc_number":null,"reason":"Akta notaris — dokumen korporat"}}
 
-Format kalau DIPOTONG:
-{{"company":"PT Krakatau Shipyard","counterparty":"PT Pertamina","should_split":true,"reason":"Campuran invoice proyek + faktur pajak","documents":[{{"doc_name":"Invoice INV-2023-001","department":"Finance","scope":"project","project":"Pembangunan 2 Tug Boat 2024","subfolder":"Invoice","page_start":0,"page_end":2,"expire_date":null,"doc_number":"INV-2023-001"}},{{"doc_name":"Faktur Pajak Des 2023","department":"Finance","scope":"company","project":null,"subfolder":"Faktur Pajak","page_start":3,"page_end":4,"expire_date":null,"doc_number":null}}]}}"""
+Format kalau DIPOTONG (tiap dokumen punya dept sendiri; invoice→Finance, penawaran→Sales):
+{{"company":"PT Krakatau Shipyard","counterparty":"PT Pertamina","should_split":true,"reason":"Campuran invoice + penawaran harga vendor","documents":[{{"doc_name":"Invoice INV-2023-001","department":"Finance","scope":"korporat","project":"Pembangunan 2 Tug Boat 2024","subfolder":"Invoice","page_start":0,"page_end":2,"expire_date":null,"doc_number":"INV-2023-001"}},{{"doc_name":"Penawaran Harga Pompa","department":"Sales","scope":"proyek","project":"Pembangunan 2 Tug Boat 2024","subfolder":"Penawaran Harga","page_start":3,"page_end":4,"expire_date":null,"doc_number":null}}]}}"""
 
     try:
         response = client.messages.create(
@@ -684,7 +694,8 @@ def resolve_destination(company: str, unit: dict, folder_index: dict, index_lock
     canon_project=False kalau nama proyek sudah dikanonikalisasi oleh pass rekonsiliasi.
     """
     department = sanitize(unit.get("department") or "Lainnya")
-    subfolder  = sanitize(unit.get("subfolder") or "Umum")
+    # subfolder boleh multi-level (mis. "Vendor/Item") — sanitize tiap segmen, pertahankan "/".
+    subfolder  = "/".join(s for s in (sanitize(x) for x in str(unit.get("subfolder") or "Umum").split("/")) if s) or "Umum"
     scope      = (unit.get("scope") or "").strip().lower()
 
     # Kanonikalisasi nama proyek terhadap proyek yang sudah ada di perusahaan ini.
@@ -709,7 +720,10 @@ def resolve_destination(company: str, unit: dict, folder_index: dict, index_lock
 
     return {
         "out_dir": out_dir, "relpath": relpath, "kind": kind,
-        "department": department, "project": project_final, "subfolder": subfolder,
+        "department": department,
+        # Folder pakai project_final; tapi METADATA proyek tetap disimpan (mis. invoice proyek
+        # yang difile di Korporat/Finance tetap bertag proyeknya) untuk vector DB.
+        "project": project_final or project, "subfolder": subfolder,
     }
 
 
