@@ -1,83 +1,106 @@
 """
-KS Pinecone Indexer — PT Krakatau Shipyard
-==========================================
-Ambil dokumen yang sudah di-split dari ./output, embed, lalu index ke Pinecone.
-Jalankan setelah process_docs.py selesai dan hasil review manual OK.
+KS Pinecone Indexer — Waralalo Group
+====================================
+Ambil dokumen yang sudah ditata oleh ingest_archive.py (--apply) dari folder
+hasil (default D:\\Arsip_Rapih), ekstrak teks (pdfplumber + OCR untuk scan),
+pecah PER-HALAMAN, lalu index ke Pinecone dengan INTEGRATED EMBEDDING
+(Pinecone yang embed server-side — tidak perlu OpenAI).
+
+Granularitas pencarian = chunk per-halaman (bukan pemotongan file fisik). Lihat
+keputusan di memory: bundel campur disimpan utuh, granularitas via chunking.
 
 Cara pakai:
-    pip install pinecone-client anthropic pdfplumber python-dotenv
-    python index_to_pinecone.py
+    pip install "pinecone[asyncio]" pdfplumber pdf2image pytesseract python-dotenv
+    python index_to_pinecone.py                     # index seluruh Arsip_Rapih
+    python index_to_pinecone.py --limit 50           # uji 50 file dulu
+    python index_to_pinecone.py --query "faktur pajak PT PAL"   # cari (tes)
+
+Env (.env): PINECONE_API_KEY, (opsional) TESSERACT_PATH, POPPLER_PATH
 """
 
 import os
+import re
 import json
+import time
 import hashlib
+import argparse
 from pathlib import Path
-from datetime import datetime, date
+from datetime import datetime
 
 import pdfplumber
-from anthropic import Anthropic
-from pinecone import Pinecone, ServerlessSpec
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# ── Konfigurasi ──────────────────────────────────────────────────────────────
-OUTPUT_DIR    = Path("./output")
-LOG_FILE      = Path("./processing_log.json")
+# ── Konfigurasi default ───────────────────────────────────────────────────────
+DEST_DIR      = Path(os.getenv("INGEST_DEST", r"D:\Arsip_Rapih"))
 INDEX_NAME    = "ks-documents"
-EMBED_MODEL   = "text-embedding-3-small"   # OpenAI — atau ganti ke provider lain
-CHUNK_SIZE    = 800    # karakter per chunk
-CHUNK_OVERLAP = 100
+EMBED_MODEL   = "multilingual-e5-large"   # integrated, 1024-dim, multilingual (ID)
+NAMESPACE     = "__default__"
+CHUNK_SIZE    = 1500     # karakter per chunk dalam satu halaman
+CHUNK_OVERLAP = 200
+OCR_PAGE_CAP  = 15       # halaman maksimum yang di-OCR per file scan (batasi waktu)
+BATCH         = 96       # upsert_records per batch
+CHECKPOINT    = Path("pinecone_indexed.json")   # set base_id yang sudah selesai
 
-# Pinecone
-pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
+# Metadata field yang dibawa per chunk (selain _id & chunk_text yang di-embed).
+META_FIELDS = ("doc_name", "company", "counterparty", "department", "project",
+               "subfolder", "relpath", "source_file", "expire_date", "doc_number")
 
-# Claude (untuk query nanti, bukan untuk embed)
-claude = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-
-
-# ── Embedding — pakai OpenAI text-embedding ───────────────────────────────────
-# Kalau mau pakai provider lain, ganti fungsi ini saja
-
+# ── OCR (self-contained, tidak butuh Anthropic) ───────────────────────────────
+TESSERACT_PATH = os.getenv("TESSERACT_PATH")
+POPPLER_PATH   = os.getenv("POPPLER_PATH")
 try:
-    from openai import OpenAI
-    oai = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
-    def embed(text: str) -> list[float]:
-        resp = oai.embeddings.create(model=EMBED_MODEL, input=text[:8000])
-        return resp.data[0].embedding
-
-    EMBED_DIM = 1536  # dimensi text-embedding-3-small
-
+    import pytesseract
+    from pdf2image import convert_from_path
+    if TESSERACT_PATH:
+        pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
+    _OCR_OK = True
 except ImportError:
-    print("⚠ openai tidak terinstall. Jalankan: pip install openai")
-    print("  Atau ganti fungsi embed() di script ini dengan provider lain.")
-    exit(1)
+    _OCR_OK = False
 
 
-# ── Utilitas ─────────────────────────────────────────────────────────────────
+def _ocr_page(pdf_path: Path, page_no: int) -> str:
+    """OCR satu halaman (1-indexed). Bahasa ind+eng. Gagal → string kosong."""
+    if not _OCR_OK:
+        return ""
+    try:
+        imgs = convert_from_path(str(pdf_path), dpi=180, first_page=page_no,
+                                 last_page=page_no, poppler_path=POPPLER_PATH or None)
+        return pytesseract.image_to_string(imgs[0], lang="ind+eng") if imgs else ""
+    except Exception:
+        return ""
 
-def extract_text(pdf_path: Path) -> str:
-    """Ekstrak teks dari PDF."""
-    parts = []
+
+def page_texts(pdf_path: Path) -> list:
+    """Kembalikan [(page_number, text)] per halaman; OCR untuk halaman tanpa teks
+    (sampai OCR_PAGE_CAP). Halaman kosong setelah usaha dibuang."""
+    pages = []
     try:
         with pdfplumber.open(pdf_path) as pdf:
-            for page in pdf.pages:
-                t = page.extract_text() or ""
-                if t.strip():
-                    parts.append(t)
+            for i, page in enumerate(pdf.pages):
+                pages.append([i + 1, (page.extract_text() or "").strip()])
     except Exception as e:
-        print(f"  ⚠ Gagal ekstrak {pdf_path.name}: {e}")
-    return "\n".join(parts)
-
-
-def chunk_text(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> list[str]:
-    """Pecah teks jadi chunks dengan overlap."""
-    if not text.strip():
+        print(f"  ⚠ gagal buka {pdf_path.name}: {e}")
         return []
-    chunks = []
-    start = 0
+    # OCR halaman yang kosong (scan) — dibatasi cap supaya tak makan waktu.
+    if any(not t for _, t in pages):
+        for row in pages:
+            pn, t = row
+            if not t and pn <= OCR_PAGE_CAP:
+                row[1] = _ocr_page(pdf_path, pn).strip()
+    return [(pn, t) for pn, t in pages if t]
+
+
+# ── Chunking per-halaman ──────────────────────────────────────────────────────
+
+def chunk_text(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> list:
+    text = re.sub(r"[ \t]+", " ", text).strip()
+    if not text:
+        return []
+    if len(text) <= size:
+        return [text]
+    chunks, start = [], 0
     while start < len(text):
         end = min(start + size, len(text))
         chunks.append(text[start:end])
@@ -87,199 +110,201 @@ def chunk_text(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) 
     return chunks
 
 
-def doc_id(pdf_path: Path) -> str:
-    """ID unik per dokumen berdasarkan path."""
-    return hashlib.md5(str(pdf_path.resolve()).encode()).hexdigest()[:16]
+def doc_id(rel: str) -> str:
+    """ID stabil per dokumen dari relpath di dalam dest (tahan pindah drive)."""
+    return hashlib.md5(rel.encode("utf-8")).hexdigest()[:16]
 
 
-def ensure_index():
-    """Buat Pinecone index kalau belum ada."""
-    existing = [i.name for i in pc.list_indexes()]
-    if INDEX_NAME not in existing:
-        print(f"  📦 Membuat Pinecone index '{INDEX_NAME}'...")
-        pc.create_index(
-            name=INDEX_NAME,
-            dimension=EMBED_DIM,
-            metric="cosine",
-            spec=ServerlessSpec(cloud="aws", region="us-east-1")
-        )
-        print(f"  ✓ Index siap")
-    return pc.Index(INDEX_NAME)
+def records_for(pdf_path: Path, base_id: str, meta: dict) -> list:
+    """Bangun record per (halaman, sub-chunk) dengan metadata file yang utuh."""
+    recs, k = [], 0
+    for page_no, text in page_texts(pdf_path):
+        for j, chunk in enumerate(chunk_text(text)):
+            rec = {"_id": f"{base_id}_p{page_no}_{j}", "chunk_text": chunk,
+                   "page_number": page_no, "chunk_index": k,
+                   "filename": pdf_path.name}
+            for f in META_FIELDS:
+                v = meta.get(f)
+                rec[f] = "" if v is None else str(v)
+            recs.append(rec)
+            k += 1
+    return recs
 
 
-# ── Load log dari process_docs.py ────────────────────────────────────────────
+# ── Metadata dari archive_log.json ────────────────────────────────────────────
 
-def load_doc_metadata() -> dict:
-    """
-    Buat mapping: absolute output path → metadata dari processing_log.json.
-    Key dibuat dari output_file yang di-resolve ke path absolut, supaya cocok
-    dengan pdf_path.resolve() di indexer (output_file disimpan sebagai path relatif).
-    """
-    meta_map = {}
-    if not LOG_FILE.exists():
-        return meta_map
+def load_meta_map(dest: Path) -> dict:
+    """output_file (absolut) → entri metadata, dari archive_log.json hasil ingest."""
+    log = dest / "archive_log.json"
+    mp = {}
+    if not log.exists():
+        print(f"  ⚠ {log} tidak ada — metadata kosong (jalankan ingest --apply dulu).")
+        return mp
     try:
-        entries = json.loads(LOG_FILE.read_text(encoding="utf-8"))
-        for e in entries:
+        for e in json.loads(log.read_text(encoding="utf-8")):
             if e.get("output_file") and e.get("status") == "ok":
-                key = str(Path(e["output_file"]).resolve())
-                meta_map[key] = e
+                mp[str(Path(e["output_file"]).resolve())] = e
+    except Exception as e:
+        print(f"  ⚠ gagal baca log: {e}")
+    return mp
+
+
+# ── Pinecone ──────────────────────────────────────────────────────────────────
+
+def get_pinecone():
+    from pinecone import Pinecone
+    key = os.getenv("PINECONE_API_KEY")
+    if not key:
+        print("\n✗ PINECONE_API_KEY tidak ada di .env\n"); raise SystemExit(1)
+    return Pinecone(api_key=key)
+
+
+def _index_ready(pc, name: str) -> bool:
+    try:
+        s = pc.describe_index(name).status
+        return bool(s.get("ready") if isinstance(s, dict) else getattr(s, "ready", False))
     except Exception:
-        pass
-    return meta_map
+        return False
 
 
-# ── Main indexer ──────────────────────────────────────────────────────────────
+def ensure_index(pc, name: str, model: str):
+    if not pc.has_index(name):
+        print(f"  📦 Membuat index '{name}' (integrated: {model})...")
+        pc.create_index_for_model(
+            name=name, cloud="aws", region="us-east-1",
+            embed={"model": model, "field_map": {"text": "chunk_text"}},
+        )
+        for _ in range(120):                 # tunggu maksimum ~2 menit
+            if _index_ready(pc, name):
+                break
+            time.sleep(1)
+        print("  ✓ Index siap")
+    return pc.Index(name)
 
-def index_all():
-    index    = ensure_index()
-    meta_map = load_doc_metadata()
 
-    # Kumpulkan semua PDF di output
-    pdf_files = list(OUTPUT_DIR.rglob("*.pdf"))
-    if not pdf_files:
-        print(f"\n📂 Tidak ada PDF di {OUTPUT_DIR}. Jalankan process_docs.py dulu.\n")
+def _load_ckpt() -> set:
+    if CHECKPOINT.exists():
+        try:
+            return set(json.loads(CHECKPOINT.read_text(encoding="utf-8")))
+        except Exception:
+            return set()
+    return set()
+
+
+def _save_ckpt(done: set):
+    CHECKPOINT.write_text(json.dumps(sorted(done)), encoding="utf-8")
+
+
+# ── Indexing utama ────────────────────────────────────────────────────────────
+
+def index_all(dest: Path, index_name: str, model: str, namespace: str, limit: int):
+    pc = get_pinecone()
+    index = ensure_index(pc, index_name, model)
+    meta_map = load_meta_map(dest)
+    done = _load_ckpt()
+
+    pdfs = [p for p in dest.rglob("*.pdf")]
+    if limit:
+        pdfs = pdfs[:limit]
+    if not pdfs:
+        print(f"\n📂 Tidak ada PDF di {dest}. Jalankan ingest_archive.py --apply dulu.\n")
         return
 
-    print(f"\n{'='*60}")
-    print(f"  KS Pinecone Indexer — PT Krakatau Shipyard")
-    print(f"  {len(pdf_files)} file PDF akan di-index")
-    print(f"{'='*60}\n")
+    print(f"\n{'='*64}\n  KS Pinecone Indexer — {len(pdfs)} PDF di {dest}")
+    print(f"  index='{index_name}' model='{model}' ns='{namespace}'\n{'='*64}\n")
 
-    indexed   = 0
-    skipped   = 0
-    total_vec = 0
+    n_doc, n_skip, n_vec, batch = 0, 0, 0, []
 
-    for pdf_path in pdf_files:
-        print(f"📄 {pdf_path.name}")
-        doc_meta = meta_map.get(str(pdf_path.resolve()), {})
-        base_id  = doc_id(pdf_path)
+    def flush():
+        nonlocal batch, n_vec
+        if batch:
+            index.upsert_records(namespace, batch)
+            n_vec += len(batch)
+            batch = []
 
-        # Cek apakah sudah pernah di-index (ada vector dengan prefix ini)
-        try:
-            check = index.fetch(ids=[f"{base_id}_0"])
-            if check.vectors:
-                print(f"  ↩ Sudah di-index, skip")
-                skipped += 1
-                continue
-        except Exception:
-            pass
-
-        text = extract_text(pdf_path)
-        if not text.strip():
-            print(f"  ⚠ Tidak ada teks (mungkin scanned image) — skip")
-            skipped += 1
+    for p in pdfs:
+        rel = str(p.relative_to(dest))
+        base = doc_id(rel)
+        if base in done:
+            n_skip += 1
             continue
-
-        chunks = chunk_text(text)
-        if not chunks:
-            skipped += 1
+        meta = meta_map.get(str(p.resolve()), {})
+        recs = records_for(p, base, meta)
+        if not recs:
+            print(f"  ⚠ {p.name}: tak ada teks (scan gagal OCR?) — skip")
+            n_skip += 1
+            done.add(base)          # jangan coba ulang terus
             continue
+        for r in recs:
+            batch.append(r)
+            if len(batch) >= BATCH:
+                flush()
+        flush()                      # tuntaskan per dokumen → checkpoint konsisten
+        done.add(base)
+        n_doc += 1
+        if n_doc % 25 == 0:
+            _save_ckpt(done)
+            print(f"  … {n_doc} dokumen, {n_vec} chunk")
+        comp = (meta.get('company') or '?')[:22]
+        print(f"  ✓ {p.name[:48]:48} [{len(recs)} chunk] {comp}")
 
-        vectors = []
-        for i, chunk in enumerate(chunks):
-            try:
-                vector = embed(chunk)
-                metadata = {
-                    "doc_name":     doc_meta.get("doc_name", pdf_path.stem),
-                    "company":      doc_meta.get("company", ""),
-                    "counterparty": doc_meta.get("counterparty") or "",
-                    "department":   doc_meta.get("department", ""),
-                    "project":      doc_meta.get("project") or "",
-                    "subfolder":    doc_meta.get("subfolder", ""),
-                    "relpath":      doc_meta.get("relpath", ""),
-                    "source_file":  doc_meta.get("source_file", ""),
-                    "filename":     pdf_path.name,
-                    "filepath":     str(pdf_path.resolve()),
-                    "expire_date":  doc_meta.get("expire_date") or "",
-                    "doc_number":   doc_meta.get("doc_number") or "",
-                    "chunk_index":  i,
-                    "chunk_total":  len(chunks),
-                    "text":         chunk,          # simpan teks untuk retrieval
-                    "indexed_at":   datetime.now().isoformat(),
-                }
-                vectors.append({
-                    "id":       f"{base_id}_{i}",
-                    "values":   vector,
-                    "metadata": metadata,
-                })
-            except Exception as e:
-                print(f"  ✗ Gagal embed chunk {i}: {e}")
-
-        if vectors:
-            # Upsert ke Pinecone (batch 100)
-            batch_size = 100
-            for b in range(0, len(vectors), batch_size):
-                index.upsert(vectors=vectors[b:b+batch_size])
-            total_vec += len(vectors)
-            indexed += 1
-            print(f"  ✓ {len(chunks)} chunks di-index → {pdf_path.parent.name}/")
-
-    print(f"\n{'='*60}")
-    print(f"  ✅ Selesai: {indexed} file di-index, {skipped} skip")
-    print(f"  🔢 Total vectors di Pinecone: {total_vec}")
-    print(f"{'='*60}\n")
+    _save_ckpt(done)
+    print(f"\n{'='*64}")
+    print(f"  ✅ {n_doc} dokumen di-index ({n_vec} chunk), {n_skip} skip")
+    print(f"  🔢 Namespace '{namespace}' di index '{index_name}'")
+    print(f"{'='*64}\n")
 
 
-# ── Query helper — buat testing ───────────────────────────────────────────────
+# ── Query helper (tes) ────────────────────────────────────────────────────────
 
-def search(query: str, top_k: int = 5, company: str = None,
-           project: str = None, department: str = None):
-    """
-    Cari dokumen di Pinecone pakai kalimat natural, opsional filter metadata.
-    Contoh:
-        search("sertifikat BKI yang masih berlaku")
-        search("invoice termin", company="PT Krakatau Shipyard", department="Finance")
-        search("gambar teknik", project="Pembangunan 2 Tug Boat 2024")
-    """
-    index  = pc.Index(INDEX_NAME)
-    vector = embed(query)
+def search(query: str, top_k: int = 5, index_name: str = INDEX_NAME,
+           namespace: str = NAMESPACE, **filters):
+    """Cari natural-language + filter metadata opsional.
+       search("faktur pajak", company="PT Krakatau Shipyard", department="Finance")"""
+    pc = get_pinecone()
+    index = pc.Index(index_name)
+    flt = {k: {"$eq": v} for k, v in filters.items() if v}
+    q = {"inputs": {"text": query}, "top_k": top_k}
+    if flt:
+        q["filter"] = flt
+    res = index.search(namespace=namespace, query=q,
+                       fields=["doc_name", "company", "department", "project",
+                               "filename", "expire_date", "page_number", "chunk_text"])
+    hits = res["result"]["hits"]
+    print(f"\n🔍 '{query}'" + (f"  filter={flt}" if flt else "") + f"  → {len(hits)} hit")
+    print("─" * 60)
+    for h in hits:
+        f = h["fields"]
+        proj = f" | proyek: {f['project']}" if f.get("project") else ""
+        exp  = f" | expire: {f['expire_date']}" if f.get("expire_date") else ""
+        print(f"  [{h['_score']:.3f}] {f.get('doc_name','')}  (hal {f.get('page_number','?')})")
+        print(f"          {f.get('company','')} / {f.get('department','')}{proj}")
+        print(f"          {f.get('filename','')}{exp}")
+        print(f"          “{(f.get('chunk_text','') or '')[:120]}…”\n")
+    return res
 
-    filter_dict = {}
-    if company:
-        filter_dict["company"] = {"$eq": company}
-    if project:
-        filter_dict["project"] = {"$eq": project}
-    if department:
-        filter_dict["department"] = {"$eq": department}
 
-    results = index.query(
-        vector=vector,
-        top_k=top_k,
-        include_metadata=True,
-        filter=filter_dict if filter_dict else None
-    )
+# ── CLI ───────────────────────────────────────────────────────────────────────
 
-    print(f"\n🔍 Query: '{query}'" + (f"  (filter: {filter_dict})" if filter_dict else ""))
-    print(f"{'─'*50}")
-    for match in results.matches:
-        m = match.metadata
-        expire = f" | expire: {m['expire_date']}" if m.get("expire_date") else ""
-        proj   = f" | proyek: {m['project']}" if m.get("project") else ""
-        print(f"  [{match.score:.3f}] {m.get('doc_name','')}")
-        print(f"          {m.get('company','')} / {m.get('department','')}{proj}")
-        print(f"          File: {m.get('filename','')}{expire}")
-        print(f"          Preview: {m.get('text','')[:120]}...")
-        print()
+def main():
+    ap = argparse.ArgumentParser(description="Index Arsip_Rapih → Pinecone (integrated embedding)")
+    ap.add_argument("--dest", default=str(DEST_DIR), help="folder hasil ingest (default D:\\Arsip_Rapih)")
+    ap.add_argument("--index", default=INDEX_NAME)
+    ap.add_argument("--model", default=EMBED_MODEL)
+    ap.add_argument("--namespace", default=NAMESPACE)
+    ap.add_argument("--limit", type=int, default=None, help="batasi jumlah PDF (uji coba)")
+    ap.add_argument("--reset-checkpoint", action="store_true", help="abaikan checkpoint, index ulang semua")
+    ap.add_argument("--query", default=None, help="mode tes: cari kalimat ini lalu keluar")
+    args = ap.parse_args()
 
-    return results
+    if args.query:
+        search(args.query, index_name=args.index, namespace=args.namespace)
+        return
+
+    if args.reset_checkpoint and CHECKPOINT.exists():
+        CHECKPOINT.unlink()
+    index_all(Path(args.dest), args.index, args.model, args.namespace, args.limit)
 
 
 if __name__ == "__main__":
-    missing = []
-    if not os.getenv("PINECONE_API_KEY"):
-        missing.append("PINECONE_API_KEY")
-    if not os.getenv("OPENAI_API_KEY"):
-        missing.append("OPENAI_API_KEY")
-
-    if missing:
-        print(f"\n✗ Key berikut tidak ada di .env: {', '.join(missing)}\n")
-        exit(1)
-
-    index_all()
-
-    # Test query setelah index
-    print("\n── Test query ──────────────────────────────────────────")
-    search("sertifikat BKI galangan kapal")
-    search("laporan keuangan terbaru", department="Finance")
-    search("kontrak pembangunan kapal", company="PT Krakatau Shipyard")
+    main()
