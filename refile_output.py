@@ -90,7 +90,7 @@ def main():
     for i in idxs:
         e    = log[i]
         comp = e.get("company") or P.UNIDENTIFIED
-        proj = (e.get("project") or "").strip() or None
+        proj = P.normalize_project(e.get("project"))   # placeholder ("00_Unidentified") → None
         dept = e.get("department") or "Lainnya"
         sub  = e.get("subfolder") or "Umum"
         kind = relpath_kind(e["relpath"])
@@ -98,7 +98,13 @@ def main():
         new_comp, new_proj = comp, proj
         if proj and (comp, proj) in proj_map:
             new_comp, new_proj = proj_map[(comp, proj)]
+        new_proj = P.normalize_project(new_proj)   # rekonsiliasi bisa balikin placeholder juga
         new_sub = sub_map.get((dept, sub), sub)
+
+        # Proyek jadi placeholder/null tapi relpath lama "project" → tentukan ulang seperti
+        # placement_relpath: Engineering/Operasional/HR → _Tanpa Proyek; sisanya → level perusahaan.
+        if kind == "project" and not new_proj:
+            kind = "noproject" if dept in P.PROJECT_ONLY_DEPTS else "company"
 
         rel      = build_relpath(kind, dept, new_sub, new_proj)
         old_path = Path(e["output_file"])

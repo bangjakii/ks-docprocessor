@@ -169,12 +169,30 @@ PROJECT_ONLY_DEPTS  = {"Engineering", "Operasional", "HR"}
 PROJECTS_FOLDER     = "Projects"
 NO_PROJECT_FOLDER   = "_Tanpa Proyek"   # nama beda dari 00_Unidentified (company) — hindari tumpang tindih
 
+# Nilai "proyek" yang sebenarnya BUKAN proyek (AI kadang isi string ini, bukan null).
+# Dianggap = tak ada proyek → masuk _Tanpa Proyek, bukan jadi folder proyek sendiri.
+# Catatan: "Lain-lain" SENGAJA tidak di sini — itu proyek catch-all yang valid dari rekonsiliasi.
+NON_PROJECT_VALUES = {
+    "00_unidentified", "unidentified", "tidak diketahui", "tidak teridentifikasi",
+    "belum diketahui", "tidak ada", "n/a", "na", "-", "--", "null", "none", "umum",
+}
+
+def normalize_project(name) -> str | None:
+    """Nama proyek bersih, atau None kalau kosong/placeholder (bukan proyek nyata)."""
+    if not name:
+        return None
+    s = str(name).strip()
+    if not s or s.lower() in NON_PROJECT_VALUES:
+        return None
+    return s
+
 def placement_relpath(department: str, scope: str, project: str):
     """
     Tentukan path relatif (di bawah folder perusahaan) untuk sebuah dokumen.
     Return (base_relpath, kind, project_final). kind ∈ {company, project, unidentified}.
     """
     dept = department or "Lainnya"
+    project = normalize_project(project)   # placeholder ("00_Unidentified" dll) → None
     if dept in COMPANY_LEVEL_DEPTS:
         return dept, "company", None
     if dept in PROJECT_ONLY_DEPTS:
@@ -667,9 +685,10 @@ def resolve_destination(company: str, unit: dict, folder_index: dict, index_lock
     scope      = (unit.get("scope") or "").strip().lower()
 
     # Kanonikalisasi nama proyek terhadap proyek yang sudah ada di perusahaan ini.
-    raw_project = unit.get("project")
+    # Buang placeholder ("00_Unidentified" dll) → None supaya masuk _Tanpa Proyek.
+    raw_project = normalize_project(unit.get("project"))
     project = None
-    if raw_project and str(raw_project).strip():
+    if raw_project:
         if canon_project:
             existing = get_existing_projects(folder_index, company)
             project  = sanitize(canonicalize_project(str(raw_project), existing))
