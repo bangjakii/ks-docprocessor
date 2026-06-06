@@ -218,7 +218,7 @@ def index_all(dest: Path, index_name: str, model: str, namespace: str, limit: in
     def flush():
         nonlocal batch, n_vec
         if batch:
-            index.upsert_records(namespace, batch)
+            index.upsert_records(namespace=namespace, records=batch)
             n_vec += len(batch)
             batch = []
 
@@ -270,14 +270,23 @@ def search(query: str, top_k: int = 5, index_name: str = INDEX_NAME,
     res = index.search(namespace=namespace, query=q,
                        fields=["doc_name", "company", "department", "project",
                                "filename", "expire_date", "page_number", "chunk_text"])
-    hits = res["result"]["hits"]
+
+    def g(obj, key, default=None):           # tahan response object ATAU dict
+        if obj is None:
+            return default
+        if isinstance(obj, dict):
+            return obj.get(key, default)
+        return getattr(obj, key, default)
+
+    hits = g(g(res, "result"), "hits") or []
     print(f"\n🔍 '{query}'" + (f"  filter={flt}" if flt else "") + f"  → {len(hits)} hit")
     print("─" * 60)
     for h in hits:
-        f = h["fields"]
-        proj = f" | proyek: {f['project']}" if f.get("project") else ""
-        exp  = f" | expire: {f['expire_date']}" if f.get("expire_date") else ""
-        print(f"  [{h['_score']:.3f}] {f.get('doc_name','')}  (hal {f.get('page_number','?')})")
+        f = g(h, "fields") or {}
+        score = g(h, "score", 0.0) or 0.0    # SDK Hit: property .score (wire _score)
+        proj = f" | proyek: {f.get('project')}" if f.get("project") else ""
+        exp  = f" | expire: {f.get('expire_date')}" if f.get("expire_date") else ""
+        print(f"  [{score:.3f}] {f.get('doc_name','')}  (hal {f.get('page_number','?')})")
         print(f"          {f.get('company','')} / {f.get('department','')}{proj}")
         print(f"          {f.get('filename','')}{exp}")
         print(f"          “{(f.get('chunk_text','') or '')[:120]}…”\n")
