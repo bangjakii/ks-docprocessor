@@ -557,35 +557,44 @@ def index_all(dest: Path, index_name: str, model: str, namespace: str, limit: in
             n_vec += len(batch)
             batch = []
 
-    for p in files:
-        rel = str(p.relative_to(dest))
-        base = doc_id(rel)
-        if base in done:
-            n_skip += 1
-            continue
-        meta = dict(meta_map.get(str(p.resolve()), {}))   # copy → boleh di-enrich
-        pages = extract_pages_any(p, cap=cap_for(meta))    # PDF/gambar/docx/xlsx; cap per doc-type
-        if ENABLE_FIELD_EXTRACT:
-            try:
-                import extract_fields as EF
-                EF.enrich(meta, " ".join(t for _, t in pages), use_llm=EXTRACT_USE_LLM)
-            except Exception as e:
-                print(f"  ⚠ extract field gagal {p.name}: {e}")
-        recs = records_for(p, base, meta, pages=pages)   # selalu >=1 (ada fallback)
-        for r in recs:
-            batch.append(r)
-            if len(batch) >= BATCH:
-                flush()
-        flush()                      # tuntaskan per dokumen → checkpoint konsisten
-        done.add(base)
-        n_doc += 1
-        if n_doc % 25 == 0:
-            _save_ckpt(done)
-            print(f"  … {n_doc} dokumen, {n_vec} chunk")
-        comp = (meta.get('company') or '?')[:22]
-        print(f"  ✓ {p.name[:48]:48} [{len(recs)} chunk] {comp}")
+    interrupted = False
+    try:
+        for p in files:
+            rel = str(p.relative_to(dest))
+            base = doc_id(rel)
+            if base in done:
+                n_skip += 1
+                continue
+            meta = dict(meta_map.get(str(p.resolve()), {}))   # copy → boleh di-enrich
+            pages = extract_pages_any(p, cap=cap_for(meta))    # PDF/gambar/docx/xlsx; cap per doc-type
+            if ENABLE_FIELD_EXTRACT:
+                try:
+                    import extract_fields as EF
+                    EF.enrich(meta, " ".join(t for _, t in pages), use_llm=EXTRACT_USE_LLM)
+                except Exception as e:
+                    print(f"  ⚠ extract field gagal {p.name}: {e}")
+            recs = records_for(p, base, meta, pages=pages)   # selalu >=1 (ada fallback)
+            for r in recs:
+                batch.append(r)
+                if len(batch) >= BATCH:
+                    flush()
+            flush()                      # tuntaskan per dokumen → checkpoint konsisten
+            done.add(base)
+            n_doc += 1
+            if n_doc % 10 == 0:
+                _save_ckpt(done)
+                print(f"  … {n_doc} dokumen, {n_vec} chunk")
+            comp = (meta.get('company') or '?')[:22]
+            print(f"  ✓ {p.name[:48]:48} [{len(recs)} chunk] {comp}")
+    except KeyboardInterrupt:
+        interrupted = True
+        print("\n  ⏸ Dihentikan user — menyimpan checkpoint...")
+    finally:
+        _save_ckpt(done)              # SELALU simpan (normal / Ctrl-C / error) → resume aman
 
-    _save_ckpt(done)
+    if interrupted:
+        print(f"  ▶ Progres tersimpan ({len(done)} dok). Jalankan lagi "
+              f"'python index_to_pinecone.py' untuk lanjut dari sini.")
     print(f"\n{'='*64}")
     print(f"  ✅ {n_doc} dokumen di-index ({n_vec} chunk), {n_skip} skip")
     print(f"  🔢 Namespace '{namespace}' di index '{index_name}'")
