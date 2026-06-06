@@ -29,12 +29,7 @@ Arsip_DryRun/
 _test_run/
 _test_run.log
 
-# Skrip diagnostik sekali-pakai (jangan track)
-diagnose_skips.py
-detect_buried_faktur.py
-prove_faktur.py
-
-# Skrip investigasi sekali-pakai
-investigate_uncertain.py
-investigate_ragu_files.py
-estimate_cost.py
+# Web UI
+webui/frontend/node_modules/
+webui/frontend/dist/
+webui/_staging/

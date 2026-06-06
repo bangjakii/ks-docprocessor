@@ -4,13 +4,15 @@ anthropic                 # klasifikasi (process_docs/ingest) + vision OCR + LLM
 python-dotenv             # baca .env
 
 # Pinecone (integrated embedding, multilingual-e5-large — TANPA OpenAI)
-pinecone[asyncio]
+pinecone                  # sync client (extra [asyncio] tidak dipakai)
 
-# PDF → teks & render
+# PDF → teks, render & potong
 pdfplumber                # ekstrak teks PDF digital
 pdf2image                 # render PDF→gambar + hitung halaman (butuh poppler terinstall)
+pypdf                     # potong/split halaman bundel (ingest split + cut search-time)
 pytesseract               # OCR tulisan cetak (butuh Tesseract-OCR terinstall)
 pillow                    # baca file gambar (.jpg/.png/…) utk OCR
+tqdm                      # progress bar ingest (opsional, ada fallback)
 
 # Office modern (ekstrak teks, gratis)
 python-docx               # .docx
