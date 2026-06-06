@@ -87,21 +87,29 @@ DOCTYPE_RULES = [
       "riwayat hidup", "biodata"],                          "HR", "Tenaga Ahli"),
     (["sertifikat keahlian", "sertifikat keamanan", "sertifikasi keamanan",
       "sertifikat keselamatan", "keselamatan kerja", " k3 ", "ijazah"], "HR", "Sertifikasi Personil"),
-    (["sdm", "personil", "personalia", "kepegawaian", "karyawan", "pegawai", "ktp direksi",
-      "skck", "gaji", "absensi"],                           "HR", "Kepegawaian"),
+    (["sdm", "personil", "personalia", "kepegawaian", "karyawan", "pegawai", "ktp",
+      "kartu keluarga", "skck", "gaji", "absensi"],         "HR", "Kepegawaian"),
     # — Finance —
+    # Pinjaman/pembiayaan (Kawan Cicil/Kancil, borrower agreement) — SEBELUM Legal/Kontrak
+    # supaya "Perjanjian Pinjaman" tak ketabrak rule "perjanjian".
+    (["pinjaman", "kancil", "kawan cicil", "borrower", "standing instruction", "kredit",
+      "loan", "personal guarantee", "jaminan perorangan"], "Finance", "Pinjaman"),
     (["invoice", "tagihan"],                                "Finance", "Invoice"),
     (["faktur", "pajak"],                                   "Finance", "Faktur & Pajak"),
     (["purchase order", " po ", "po-", "pesanan pembelian", "pesanan pembelan"], "Finance", "Purchase Order"),
-    (["bank garansi", "garansi bank"],                      "Finance", "Bank Garansi"),
+    (["bank garansi", "garansi bank", "jaminan penawaran", "jaminan pelaksanaan",
+      "jaminan uang muka", "jaminan pemeliharaan"],         "Finance", "Bank Garansi"),
     (["memo pembayaran", "permohonan pembayaran", "pembayaran", "pelunasan", "kwitansi", "termin"],
                                                             "Finance", "Pembayaran"),
     (["laporan keuangan", "lapkeu", "neraca", "cash flow", "arus kas", "anggaran", " rab ",
       "rekening", " aset", "asset"],                        "Finance", "Laporan Keuangan & Aset"),
     # — Sales —
-    (["penawaran", "penaawaran", "harga", "quotation", "spph"], "Sales", "Penawaran Harga"),
-    (["tender", "lelang", "prakualifikasi", "kualifikasi", "sampul", "lpse", "rks", " bid "],
-                                                            "Sales", "Tender"),
+    (["penawaran", "penaawaran", "harga", "quotation", "spph", "sph", "estimasi biaya",
+      "konfirmasi dock", "dock space", "ketersediaan dock", "konfirmasi ketersediaan"],
+                                                            "Sales", "Penawaran Harga"),
+    (["tender", "lelang", "pelelangan", "prakualifikasi", "kualifikasi", "sampul", "lpse",
+      "rks", " bid ", " sdp ", "bahp", "sppbj", "adendum", "addendum", "dokumen pelelangan",
+      "dokumen pemilihan", "pemilihan penyedia", "aanwijzing"], "Sales", "Tender"),
     # Sertifikat TANAH/HAK = aset legal, BUKAN sertifikat material engineering.
     # WAJIB sebelum rule "sertifikat" generik di bawah (match pertama menang).
     (["sertifikat tanah", "sertifikat hak milik", "sertifikat hgb", "hak guna bangunan",
@@ -122,7 +130,10 @@ DOCTYPE_RULES = [
                                                             "Engineering", "Brosur & Spesifikasi Alat"),
     # — Operasional —
     (["bast", "berita acara", "serah terima"],              "Operasional", "BAST"),
-    (["surat perintah kerja", " spk", "work order"],        "Operasional", "SPK"),
+    (["surat perintah kerja", " spk", "work order", "order pekerjaan", "surat order"],
+                                                            "Operasional", "SPK"),
+    (["docking", "undocking", "docking repair", "repair list", "perbaikan kapal",
+      "naik dock", "floating repair"],                      "Operasional", "Docking & Repair"),
     (["pengajuan barang", "permintaan barang", "permintaan material", "purchase requisition"],
                                                             "Operasional", "Pengajuan Barang"),
     (["surat jalan", "delivery order", "tanda terima barang", "bukti terima barang"],
@@ -135,6 +146,10 @@ DOCTYPE_RULES = [
     (["pengadaan", "material", "logistik", "logistic", " spb", "pengiriman", "delivery",
       "gudang", "bongkaran", "mobilisasi", " stock", "persiapan pembangunan", "produksi"],
                                                             "Operasional", "Pengadaan"),
+    # Folder foto/galeri (DSC_xxxx, Foto Kapal/Kunjungan) → dokumentasi.
+    # JANGAN biarkan ke analisis Claude vision (foto tanpa teks = buang biaya).
+    (["foto", "photo", "image", "galeri", "gallery", "dokumentasi", "photograph"],
+                                                            "Operasional", "Dokumentasi"),
     # — Marketing — ("marketing"/"maketing" DIBUANG: cocok folder "MAKETING TENDER" → tender
     #   salah jadi Marketing. Pakai frasa spesifik dokumen marketing saja.)
     (["company profile", "profil perusahaan", "presentasi perusahaan",
@@ -149,6 +164,12 @@ DOCTYPE_RULES = [
     (["legalitas", "legal", "hukum"],                       "Legal", "Legalitas & Izin"),
     # — IT —
     (["website", " web ", "aplikasi", "software", "sistem informasi"], "IT", "Sistem & Aplikasi"),
+    # CATCH-ALL korespondensi: surat/memo/nota umum yg tak match jenis spesifik di atas.
+    # Ditaruh PALING AKHIR supaya semua rule spesifik (penawaran/SPK/izin/dll) menang dulu.
+    (["surat dukungan", "surat keterangan", "surat pernyataan", "surat permohonan",
+      "surat undangan", "surat kuasa", "surat tugas", "nota dinas", "disposisi",
+      "notulen", "notulensi", "risalah rapat", "memo", "surat"],
+                                                            "Operasional", "Korespondensi"),
 ]
 
 # ── Proyek KANONIK ────────────────────────────────────────────────────────────
@@ -296,6 +317,9 @@ _JV_PAIR = {"PT Krakatau Shipyard", "KSO DKB-KS"}
 # tak menemukan apa pun — jadi sister-company/vendor di dalamnya tetap ter-pisah lebih dulu.
 TOP_DEFAULT_COMPANY = {
     "back up": "PT Krakatau Shipyard",
+    # Folder tender marketing KS (tanpa nama company di path) → semua tender milik KS.
+    "maketing tender": "PT Krakatau Shipyard",
+    "marketing tender": "PT Krakatau Shipyard",
 }
 
 
