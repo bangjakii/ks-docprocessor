@@ -55,7 +55,7 @@ EMBED_MODEL   = "multilingual-e5-large"   # integrated, 1024-dim, multilingual (
 NAMESPACE     = "__default__"
 CHUNK_SIZE    = 1500     # karakter per chunk dalam satu halaman
 CHUNK_OVERLAP = 200
-OCR_PAGE_CAP  = 15       # halaman maksimum yang di-OCR per file scan (batasi waktu)
+# OCR_PAGE_CAP didefinisikan di blok OCR di bawah (default/high/low per doc-type).
 BATCH         = 96       # upsert_records per batch
 CHECKPOINT    = Path("pinecone_indexed.json")   # set base_id yang sudah selesai
 
@@ -69,14 +69,35 @@ META_FIELDS = ("doc_name", "company", "counterparty", "department", "project",
 # Halaman gambar/kosong minim-teks → di-SKIP (biar vision ga ngarang).
 # Override: OCR_ENGINE=tesseract (paksa tesseract) | vision (paksa vision) | hybrid.
 OCR_ENGINE     = os.getenv("OCR_ENGINE", "hybrid").lower()     # "hybrid" | "vision" | "tesseract"
-VISION_MODEL   = os.getenv("VISION_MODEL", "claude-opus-4-8")  # bisa diturunin utk hemat (bulk: haiku)
-# Scan TERJELEK (conf sangat rendah) → model vision TERKUAT (OCR paling bersih).
-# Default opus; produksi biasanya VISION_MODEL=haiku + STRONG=opus (kuat utk yg terburuk saja).
-VISION_MODEL_STRONG = os.getenv("VISION_MODEL_STRONG", "claude-opus-4-8")
+# Default HEMAT: haiku utk vision normal, sonnet utk scan TERJELEK (conf rendah).
+# Naikkan ke opus (VISION_MODEL_STRONG=claude-opus-4-8) kalau mau kualitas maksimal.
+VISION_MODEL        = os.getenv("VISION_MODEL", "claude-haiku-4-5")
+VISION_MODEL_STRONG = os.getenv("VISION_MODEL_STRONG", "claude-sonnet-4-6")
 # Knob router hybrid (bisa dikalibrasi via env):
 OCR_CONF_OK     = float(os.getenv("OCR_CONF_OK", "75"))      # conf >= ini & rapi → keep tesseract (gratis)
 OCR_CONF_STRONG = float(os.getenv("OCR_CONF_STRONG", "55"))  # conf < ini → vision pakai model KUAT
 OCR_MIN_INK     = int(os.getenv("OCR_MIN_INK", "4"))         # kata < ini & low-conf → blank/drawing → skip
+# OCR_PAGE_CAP per DOC-TYPE (B): bundel Finance/invoice TINGGI (faktur nyempil di dalam),
+# engineering/drawing RENDAH (hal 2+ cuma gambar). Lainnya = default.
+OCR_PAGE_CAP   = int(os.getenv("OCR_PAGE_CAP", "5"))         # default/medium
+OCR_CAP_HIGH   = int(os.getenv("OCR_CAP_HIGH", "8"))         # Finance/invoice/faktur/pinjaman (faktur ≤hal4 + kwitansi/bukti)
+OCR_CAP_LOW    = int(os.getenv("OCR_CAP_LOW", "2"))          # engineering/drawing/brosur
+_CAP_HIGH_KW = ("invoice", "faktur", "tagihan", "pembayaran", "kwitansi", "finance",
+                "keuangan", "pinjaman", "borrower", "bundel")
+_CAP_LOW_KW  = ("engineering", "drawing", "gambar", "general arrangement", " ga ", "abs",
+                "brosur", "spesifikasi", "katalog", "datasheet")
+
+
+def cap_for(meta: dict) -> int:
+    """OCR_PAGE_CAP sesuai doc-type (dari department/subfolder/doc_name)."""
+    blob = " " + re.sub(r"[^a-z0-9 ]", " ",
+                        " ".join(str(meta.get(x, "")) for x in
+                                 ("department", "subfolder", "doc_name")).lower()) + " "
+    if any(k in blob for k in _CAP_LOW_KW):
+        return OCR_CAP_LOW
+    if any(k in blob for k in _CAP_HIGH_KW):
+        return OCR_CAP_HIGH
+    return OCR_PAGE_CAP
 # Ekstraksi field terstruktur (doc_number/expire_date/counterparty): regex gratis +
 # LLM fallback tertarget. Matikan dgn EXTRACT_FIELDS=0 (atau LLM saja: EXTRACT_LLM=0).
 ENABLE_FIELD_EXTRACT = os.getenv("EXTRACT_FIELDS", "1").lower() not in ("0", "false", "no")
@@ -263,10 +284,13 @@ def _looks_garbled(t: str) -> bool:
     return long_ratio > 0.12 or space_ratio < 0.09 or max_tok > 35
 
 
-def page_texts(pdf_path: Path) -> list:
+def page_texts(pdf_path: Path, cap: int = None) -> list:
     """Kembalikan [(page_number, text)] per halaman. Halaman digital bersih →
     pdfplumber (gratis). Halaman KOSONG (scan) ATAU ber-layer teks RUSAK → dibaca
-    ulang via vision (read_scan_page), dibatasi OCR_PAGE_CAP. Halaman tetap kosong dibuang."""
+    ulang via vision (read_scan_page), dibatasi `cap` (default OCR_PAGE_CAP).
+    Halaman digital tetap diambil semua; cap HANYA membatasi halaman scan yg di-OCR."""
+    if cap is None:
+        cap = OCR_PAGE_CAP
     pages = []
     try:
         with pdfplumber.open(pdf_path) as pdf:
@@ -282,8 +306,8 @@ def page_texts(pdf_path: Path) -> list:
         pages.append([pn, ""])
     for row in pages:
         pn, t = row
-        if pn <= OCR_PAGE_CAP and (not t or _looks_garbled(t)):
-            v = read_scan_page(pdf_path, pn).strip()      # vision (default)
+        if pn <= cap and (not t or _looks_garbled(t)):
+            v = read_scan_page(pdf_path, pn).strip()      # OCR hybrid
             if v:
                 row[1] = v
     return [(pn, t) for pn, t in pages if t]
@@ -353,12 +377,13 @@ def xlsx_texts(path: Path) -> list:
         return []
 
 
-def extract_pages_any(path: Path) -> list:
-    """Dispatcher per ekstensi → [(page, text)]. Tipe tak terdukung → [] (nanti
-    dapat fallback record nama+metadata di records_for)."""
+def extract_pages_any(path: Path, cap: int = None) -> list:
+    """Dispatcher per ekstensi → [(page, text)]. `cap` membatasi halaman scan PDF
+    yg di-OCR (per doc-type via cap_for). Tipe tak terdukung → [] (nanti dapat
+    fallback record nama+metadata di records_for)."""
     s = path.suffix.lower()
     if s == ".pdf":
-        return page_texts(path)
+        return page_texts(path, cap=cap)
     if s in _IMG_EXT:
         return image_texts(path)
     if s in _DOCX_EXT:
@@ -539,7 +564,7 @@ def index_all(dest: Path, index_name: str, model: str, namespace: str, limit: in
             n_skip += 1
             continue
         meta = dict(meta_map.get(str(p.resolve()), {}))   # copy → boleh di-enrich
-        pages = extract_pages_any(p)                       # PDF / gambar / docx / xlsx
+        pages = extract_pages_any(p, cap=cap_for(meta))    # PDF/gambar/docx/xlsx; cap per doc-type
         if ENABLE_FIELD_EXTRACT:
             try:
                 import extract_fields as EF

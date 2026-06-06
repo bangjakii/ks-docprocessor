@@ -35,10 +35,10 @@ OUTPUT_DIR   = Path("./output")
 LOG_FILE     = Path("./processing_log.json")
 FOLDER_INDEX = Path("./folder_index.json")
 
-CLAUDE_MODEL = "claude-sonnet-4-5"
+CLAUDE_MODEL = "claude-sonnet-4-6"
 MAX_WORKERS  = 5   # file diproses paralel — override lewat --workers
 
-# Harga claude-sonnet-4-5 per 1 juta token (USD).
+# Harga claude-sonnet-4-6 per 1 juta token (USD) — sama dgn 4-5.
 PRICE_INPUT_PER_MTOK  = 3.0
 PRICE_OUTPUT_PER_MTOK = 15.0
 USD_TO_IDR            = 16000   # perkiraan kasar untuk tampilan rupiah
