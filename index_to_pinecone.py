@@ -294,17 +294,27 @@ def read_scan_page(pdf_path: Path, page_no: int) -> str:
 
 def _looks_garbled(t: str) -> bool:
     """Deteksi layer teks RUSAK (OCR scanner jelek yg ke-embed di PDF): banyak token
-    'kata-mash' kepanjangan atau spasi terlalu sedikit. Teks bersih → False."""
+    'kata-mash' kepanjangan (HURUF nyambung) atau spasi terlalu sedikit. Teks bersih
+    → False. Abaikan deret titik/garis (leader formulir), GUID, & string angka — itu
+    bukan teks rusak, biar tidak salah picu re-OCR vision (buang biaya)."""
     t = t.strip()
     if len(t) < 40:
         return False
-    toks = t.split()
+    t2 = re.sub(r"[._\-–—…·•*=]{4,}", " ", t)        # buang leader titik/garis formulir
+    toks = [w for w in t2.split() if w]
     if not toks:
         return True
-    long_ratio  = sum(1 for w in toks if len(w) > 18) / len(toks)
-    space_ratio = t.count(" ") / len(t)
-    max_tok     = max(len(w) for w in toks)     # 1 token mash >35 char = hampir pasti rusak
-    return long_ratio > 0.12 or space_ratio < 0.09 or max_tok > 35
+
+    def _wordmash(w):                                # huruf nyambung kepanjangan = OCR rusak
+        a = sum(c.isalpha() for c in w)
+        return len(w) > 18 and a / len(w) > 0.7      # bukan GUID/angka (yg byk non-huruf)
+
+    # ukur kerapatan spasi pada PROSA saja: token panjang non-kata (GUID/kode) dibuang
+    prose = re.sub(r"\S{19,}", lambda m: m.group(0) if _wordmash(m.group(0)) else " ", t2)
+    long_ratio  = sum(1 for w in toks if _wordmash(w)) / len(toks)
+    space_ratio = prose.count(" ") / max(len(prose), 1)
+    max_word    = max((len(w) for w in toks if _wordmash(w)), default=0)
+    return long_ratio > 0.12 or space_ratio < 0.07 or max_word > 38
 
 
 def page_texts(pdf_path: Path, cap: int = None) -> list:

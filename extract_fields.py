@@ -49,23 +49,35 @@ def extract_doc_number(text: str):
 # ── expire_date ───────────────────────────────────────────────────────────────
 _BULAN = ("januari februari maret april mei juni juli agustus september "
           "oktober november desember").split()
+_EN_FULL = ("january february march april may june july august september "
+            "october november december").split()
 _MON = {b: i + 1 for i, b in enumerate(_BULAN)}
-_DATE = (r"(\d{1,2}\s+(?:" + "|".join(_BULAN) + r")\s+\d{4}"
-         r"|\d{1,2}\s*[/\-.]\s*\d{1,2}\s*[/\-.]\s*\d{2,4})")
+_MON.update({b: i + 1 for i, b in enumerate(_EN_FULL)})
+_MON.update({"jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+             "jul": 7, "aug": 8, "sep": 9, "sept": 9, "oct": 10, "nov": 11,
+             "dec": 12,  # Inggris singkat
+             "peb": 2, "agt": 8, "agst": 8, "okt": 10, "nop": 11, "des": 12})  # Indo singkat
+_MONTHS = "|".join(sorted(_MON, key=len, reverse=True))  # terpanjang dulu (september > sep)
+_SEP = r"[^0-9A-Za-z]{1,4}"  # pemisah longgar (spasi/koma/kutip/titik) — toleran noise OCR
+_DATE = (r"(\d{1,2}\s+(?:" + _MONTHS + r")" + _SEP + r"\d{4}"           # 16 feb 2015 / 04 oktober 2021
+         r"|(?:" + _MONTHS + r")" + _SEP + r"\d{1,2}" + _SEP + r"\d{4}"  # august 16, 2022 / august 16" 2022
+         r"|\d{1,2}\s*[/\-.]\s*\d{1,2}\s*[/\-.]\s*\d{2,4})")            # 04/10/2021
 _EXPIRE = re.compile(
     r"(?:masa\s+berlaku|berlaku\s+(?:s(?:ampai|\.?\s*d\.?|/d)|hingga)"
     r"(?:\s+(?:dengan\s+)?tanggal)?|s\.?\s*/?\s*d\.?\s*tanggal|"
     r"sampai\s+dengan(?:\s+tanggal)?|berakhir\s+(?:pada\s+)?(?:tanggal\s+)?|"
-    r"valid\s+until|expir\w*)[^0-9]{0,25}" + _DATE, re.I)
+    r"valid\s+(?:until|to|thru)|date\s+of\s+expir\w*|expir\w*|"
+    r"masa\s+laku)[^0-9A-Za-z]{0,8}(?:date[^0-9A-Za-z]{0,4})?" + _DATE, re.I)
 
 
 def _norm_date(s: str):
-    s = s.strip()
-    m = re.match(r"(\d{1,2})\s+([a-zA-Z]+)\s+(\d{4})", s)
-    if m:
-        mo = _MON.get(m.group(2).lower())
-        if mo:
-            return f"{m.group(3)}-{mo:02d}-{int(m.group(1)):02d}"
+    s = re.sub(r"\s+", " ", s.strip().lower())
+    m = re.match(r"(\d{1,2})\s+([a-z]+)[^0-9a-z]{1,4}(\d{4})", s)         # DD BULAN YYYY
+    if m and m.group(2) in _MON:
+        return f"{m.group(3)}-{_MON[m.group(2)]:02d}-{int(m.group(1)):02d}"
+    m = re.match(r"([a-z]+)[^0-9a-z]{1,4}(\d{1,2})[^0-9a-z]{1,4}(\d{4})", s)  # BULAN DD YYYY (Inggris)
+    if m and m.group(1) in _MON:
+        return f"{m.group(3)}-{_MON[m.group(1)]:02d}-{int(m.group(2)):02d}"
     m = re.match(r"(\d{1,2})\s*[/\-.]\s*(\d{1,2})\s*[/\-.]\s*(\d{2,4})", s)
     if m:
         d, mo, y = int(m.group(1)), int(m.group(2)), m.group(3)
@@ -76,8 +88,15 @@ def _norm_date(s: str):
 
 
 def extract_expire_date(text: str):
+    """Hanya kembalikan ISO yyyy-mm-dd dgn tahun masuk akal (1990-2099) → buang
+    false-positive OCR (mis. angka ngaco jadi '2111-11-21')."""
     m = _EXPIRE.search(text)
-    return _norm_date(m.group(1)) if m else None
+    if not m:
+        return None
+    iso = _norm_date(m.group(1))
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", iso) and 1990 <= int(iso[:4]) <= 2099:
+        return iso
+    return None
 
 
 # ── counterparty ──────────────────────────────────────────────────────────────
