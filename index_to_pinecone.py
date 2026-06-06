@@ -136,10 +136,25 @@ def read_scan_page(pdf_path: Path, page_no: int) -> str:
         else _vision_page(pdf_path, page_no)
 
 
+def _looks_garbled(t: str) -> bool:
+    """Deteksi layer teks RUSAK (OCR scanner jelek yg ke-embed di PDF): banyak token
+    'kata-mash' kepanjangan atau spasi terlalu sedikit. Teks bersih → False."""
+    t = t.strip()
+    if len(t) < 40:
+        return False
+    toks = t.split()
+    if not toks:
+        return True
+    long_ratio  = sum(1 for w in toks if len(w) > 18) / len(toks)
+    space_ratio = t.count(" ") / len(t)
+    max_tok     = max(len(w) for w in toks)     # 1 token mash >35 char = hampir pasti rusak
+    return long_ratio > 0.12 or space_ratio < 0.09 or max_tok > 35
+
+
 def page_texts(pdf_path: Path) -> list:
-    """Kembalikan [(page_number, text)] per halaman. Halaman digital → pdfplumber
-    (gratis, bersih); halaman scan (kosong) → read_scan_page (vision/tesseract),
-    dibatasi OCR_PAGE_CAP. Halaman kosong setelah usaha dibuang."""
+    """Kembalikan [(page_number, text)] per halaman. Halaman digital bersih →
+    pdfplumber (gratis). Halaman KOSONG (scan) ATAU ber-layer teks RUSAK → dibaca
+    ulang via vision (read_scan_page), dibatasi OCR_PAGE_CAP. Halaman tetap kosong dibuang."""
     pages = []
     try:
         with pdfplumber.open(pdf_path) as pdf:
@@ -148,11 +163,12 @@ def page_texts(pdf_path: Path) -> list:
     except Exception as e:
         print(f"  ⚠ gagal buka {pdf_path.name}: {e}")
         return []
-    if any(not t for _, t in pages):
-        for row in pages:
-            pn, t = row
-            if not t and pn <= OCR_PAGE_CAP:
-                row[1] = read_scan_page(pdf_path, pn).strip()
+    for row in pages:
+        pn, t = row
+        if pn <= OCR_PAGE_CAP and (not t or _looks_garbled(t)):
+            v = read_scan_page(pdf_path, pn).strip()      # vision (default)
+            if v:
+                row[1] = v
     return [(pn, t) for pn, t in pages if t]
 
 
@@ -223,6 +239,20 @@ def get_pinecone():
     return Pinecone(api_key=key)
 
 
+def retry(fn, tries: int = 5, delay: float = 3.0, what: str = "pinecone"):
+    """Ulangi call Pinecone yang gagal (control-plane api.pinecone.io kadang timeout)."""
+    last = None
+    for i in range(tries):
+        try:
+            return fn()
+        except Exception as e:
+            last = e
+            if i < tries - 1:
+                print(f"    ⏳ {what} gagal ({type(e).__name__}) — coba lagi {i+1}/{tries}...")
+                time.sleep(delay)
+    raise last
+
+
 def _index_ready(pc, name: str) -> bool:
     try:
         s = pc.describe_index(name).status
@@ -282,7 +312,7 @@ def index_all(dest: Path, index_name: str, model: str, namespace: str, limit: in
     def flush():
         nonlocal batch, n_vec
         if batch:
-            index.upsert_records(namespace=namespace, records=batch)
+            retry(lambda: index.upsert_records(namespace=namespace, records=batch), what="upsert")
             n_vec += len(batch)
             batch = []
 
@@ -326,14 +356,15 @@ def search(query: str, top_k: int = 5, index_name: str = INDEX_NAME,
     """Cari natural-language + filter metadata opsional.
        search("faktur pajak", company="PT Krakatau Shipyard", department="Finance")"""
     pc = get_pinecone()
-    index = pc.Index(index_name)
+    index = retry(lambda: pc.Index(index_name), what="resolve index")
     flt = {k: {"$eq": v} for k, v in filters.items() if v}
     q = {"inputs": {"text": query}, "top_k": top_k}
     if flt:
         q["filter"] = flt
-    res = index.search(namespace=namespace, query=q,
-                       fields=["doc_name", "company", "department", "project",
-                               "filename", "expire_date", "page_number", "chunk_text"])
+    res = retry(lambda: index.search(
+        namespace=namespace, query=q,
+        fields=["doc_name", "company", "department", "project",
+                "filename", "expire_date", "page_number", "chunk_text"]), what="search")
 
     def g(obj, key, default=None):           # tahan response object ATAU dict
         if obj is None:
