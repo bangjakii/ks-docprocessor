@@ -102,6 +102,10 @@ DOCTYPE_RULES = [
     (["penawaran", "penaawaran", "harga", "quotation", "spph"], "Sales", "Penawaran Harga"),
     (["tender", "lelang", "prakualifikasi", "kualifikasi", "sampul", "lpse", "rks", " bid "],
                                                             "Sales", "Tender"),
+    # Sertifikat TANAH/HAK = aset legal, BUKAN sertifikat material engineering.
+    # WAJIB sebelum rule "sertifikat" generik di bawah (match pertama menang).
+    (["sertifikat tanah", "sertifikat hak milik", "sertifikat hgb", "hak guna bangunan",
+      "pelepasan hak", "girik"],                            "Legal", "Tanah"),
     # — Engineering (termasuk sertifikat material/alat) —
     (["gambar teknik", "gambar", "drawing", "general arrangement", " ga ", "key plan",
       "lines plan", "midship"],                             "Engineering", "Gambar"),
