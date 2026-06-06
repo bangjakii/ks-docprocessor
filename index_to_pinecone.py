@@ -9,19 +9,25 @@ pecah PER-HALAMAN, lalu index ke Pinecone dengan INTEGRATED EMBEDDING
 Granularitas pencarian = chunk per-halaman (bukan pemotongan file fisik). Lihat
 keputusan di memory: bundel campur disimpan utuh, granularitas via chunking.
 
+Baca scan: default Claude VISION (teks bersih), bukan Tesseract. Ganti via
+env OCR_ENGINE=tesseract kalau mau banding/hemat.
+
 Cara pakai:
-    pip install "pinecone[asyncio]" pdfplumber pdf2image pytesseract python-dotenv
-    python index_to_pinecone.py                     # index seluruh Arsip_Rapih
+    pip install "pinecone[asyncio]" pdfplumber pdf2image pytesseract anthropic python-dotenv
+    python index_to_pinecone.py                     # index seluruh Arsip_Rapih (vision)
     python index_to_pinecone.py --limit 50           # uji 50 file dulu
     python index_to_pinecone.py --query "faktur pajak PT PAL"   # cari (tes)
 
-Env (.env): PINECONE_API_KEY, (opsional) TESSERACT_PATH, POPPLER_PATH
+Env (.env): PINECONE_API_KEY, ANTHROPIC_API_KEY (vision), POPPLER_PATH (render),
+            TESSERACT_PATH (kalau OCR_ENGINE=tesseract), VISION_MODEL (opsional)
 """
 
 import os
+import io
 import re
 import json
 import time
+import base64
 import hashlib
 import argparse
 from pathlib import Path
@@ -47,7 +53,12 @@ CHECKPOINT    = Path("pinecone_indexed.json")   # set base_id yang sudah selesai
 META_FIELDS = ("doc_name", "company", "counterparty", "department", "project",
                "subfolder", "relpath", "source_file", "expire_date", "doc_number")
 
-# ── OCR (self-contained, tidak butuh Anthropic) ───────────────────────────────
+# ── Baca scan: Claude VISION (default) atau Tesseract ─────────────────────────
+# Tesseract di scan Indonesia sering ngehasilin teks rusak → embedding garbage →
+# retrieval jelek. Default-nya pakai Claude vision (teks bersih). Ganti via env
+# OCR_ENGINE=tesseract kalau mau banding / hemat.
+OCR_ENGINE     = os.getenv("OCR_ENGINE", "vision").lower()     # "vision" | "tesseract"
+VISION_MODEL   = os.getenv("VISION_MODEL", "claude-opus-4-8")  # bisa diturunin utk hemat
 TESSERACT_PATH = os.getenv("TESSERACT_PATH")
 POPPLER_PATH   = os.getenv("POPPLER_PATH")
 try:
@@ -55,26 +66,80 @@ try:
     from pdf2image import convert_from_path
     if TESSERACT_PATH:
         pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
-    _OCR_OK = True
+    _RENDER_OK = True
 except ImportError:
-    _OCR_OK = False
+    _RENDER_OK = False
+
+_VISION_PROMPT = (
+    "Transkripsikan SELURUH teks pada halaman dokumen ini secara verbatim (persis apa "
+    "adanya) dalam bahasa aslinya: kop surat, nomor & tanggal dokumen, nama perusahaan, "
+    "angka, dan isi tabel (tulis baris per baris). Pertahankan urutan baca. JANGAN "
+    "merangkum, menerjemahkan, menambah komentar, atau memakai format markdown "
+    "(tanpa **, #, atau bullet) — keluarkan HANYA teks polos hasil transkripsi."
+)
+
+_claude_client = None
+def _get_claude():
+    global _claude_client
+    if _claude_client is None:
+        from anthropic import Anthropic
+        _claude_client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+    return _claude_client
 
 
-def _ocr_page(pdf_path: Path, page_no: int) -> str:
-    """OCR satu halaman (1-indexed). Bahasa ind+eng. Gagal → string kosong."""
-    if not _OCR_OK:
-        return ""
+def _render_page(pdf_path: Path, page_no: int, dpi: int = 150):
+    """Render satu halaman PDF → PIL image (1-indexed). None kalau gagal."""
+    if not _RENDER_OK:
+        return None
     try:
-        imgs = convert_from_path(str(pdf_path), dpi=180, first_page=page_no,
+        imgs = convert_from_path(str(pdf_path), dpi=dpi, first_page=page_no,
                                  last_page=page_no, poppler_path=POPPLER_PATH or None)
-        return pytesseract.image_to_string(imgs[0], lang="ind+eng") if imgs else ""
+        return imgs[0] if imgs else None
+    except Exception:
+        return None
+
+
+def _tesseract_page(pdf_path: Path, page_no: int) -> str:
+    img = _render_page(pdf_path, page_no, dpi=180)
+    try:
+        return pytesseract.image_to_string(img, lang="ind+eng") if img is not None else ""
     except Exception:
         return ""
 
 
+def _vision_page(pdf_path: Path, page_no: int) -> str:
+    """Baca halaman scan pakai Claude vision → teks bersih (jauh > Tesseract di scan ID)."""
+    img = _render_page(pdf_path, page_no, dpi=150)
+    if img is None:
+        return ""
+    try:
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=85)
+        b64 = base64.b64encode(buf.getvalue()).decode()
+        msg = _get_claude().messages.create(
+            model=VISION_MODEL, max_tokens=2048,
+            messages=[{"role": "user", "content": [
+                {"type": "image", "source": {"type": "base64",
+                 "media_type": "image/jpeg", "data": b64}},
+                {"type": "text", "text": _VISION_PROMPT},
+            ]}],
+        )
+        return "".join(b.text for b in msg.content if getattr(b, "type", None) == "text").strip()
+    except Exception as e:
+        print(f"    ⚠ vision gagal hal {page_no} {pdf_path.name}: {e}")
+        return ""
+
+
+def read_scan_page(pdf_path: Path, page_no: int) -> str:
+    """Baca satu halaman scan sesuai OCR_ENGINE."""
+    return _tesseract_page(pdf_path, page_no) if OCR_ENGINE == "tesseract" \
+        else _vision_page(pdf_path, page_no)
+
+
 def page_texts(pdf_path: Path) -> list:
-    """Kembalikan [(page_number, text)] per halaman; OCR untuk halaman tanpa teks
-    (sampai OCR_PAGE_CAP). Halaman kosong setelah usaha dibuang."""
+    """Kembalikan [(page_number, text)] per halaman. Halaman digital → pdfplumber
+    (gratis, bersih); halaman scan (kosong) → read_scan_page (vision/tesseract),
+    dibatasi OCR_PAGE_CAP. Halaman kosong setelah usaha dibuang."""
     pages = []
     try:
         with pdfplumber.open(pdf_path) as pdf:
@@ -83,12 +148,11 @@ def page_texts(pdf_path: Path) -> list:
     except Exception as e:
         print(f"  ⚠ gagal buka {pdf_path.name}: {e}")
         return []
-    # OCR halaman yang kosong (scan) — dibatasi cap supaya tak makan waktu.
     if any(not t for _, t in pages):
         for row in pages:
             pn, t = row
             if not t and pn <= OCR_PAGE_CAP:
-                row[1] = _ocr_page(pdf_path, pn).strip()
+                row[1] = read_scan_page(pdf_path, pn).strip()
     return [(pn, t) for pn, t in pages if t]
 
 
