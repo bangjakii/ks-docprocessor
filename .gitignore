@@ -28,3 +28,8 @@ Arsip_Rapih/
 Arsip_DryRun/
 _test_run/
 _test_run.log
+
+# Skrip diagnostik sekali-pakai (jangan track)
+diagnose_skips.py
+detect_buried_faktur.py
+prove_faktur.py
