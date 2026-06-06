@@ -523,10 +523,9 @@ def extract_text(pdf_path: Path, max_chars: int = 10000) -> str:
     except Exception as e:
         print(f"  ⚠ Gagal ekstrak: {e}")
 
-    combined = "\n\n".join(parts)
-    if len(combined.strip()) < 80:
-        combined = ocr_pdf(pdf_path)
-    return combined[:max_chars]
+    # Digital only — scan (tanpa layer teks) dibaca via Claude vision di analyze_pdf,
+    # bukan Tesseract (OCR Tesseract di scan ID sering rusak → klasifikasi salah).
+    return "\n\n".join(parts)[:max_chars]
 
 
 # ── Utilitas ──────────────────────────────────────────────────────────────────
@@ -576,12 +575,36 @@ def save_pdf_pages(pdf_path: Path, page_start: int, page_end: int, out_path: Pat
 
 # ── Analisis Claude ───────────────────────────────────────────────────────────
 
+VISION_PAGE_CAP = 4   # halaman awal scan yang dikirim ke Claude untuk klasifikasi
+
+
+def render_pages_b64(pdf_path: Path, max_pages: int = VISION_PAGE_CAP) -> list:
+    """Render halaman awal PDF → list base64 JPEG, untuk klasifikasi scan via vision."""
+    try:
+        import io, base64
+        from pdf2image import convert_from_path
+        poppler_path = os.getenv("POPPLER_PATH") or None
+        images = convert_from_path(str(pdf_path), dpi=150, last_page=max_pages,
+                                   poppler_path=poppler_path)
+        out = []
+        for im in images:
+            buf = io.BytesIO()
+            im.save(buf, format="JPEG", quality=85)
+            out.append(base64.b64encode(buf.getvalue()).decode())
+        return out
+    except Exception as e:
+        print(f"  ⚠ render gambar gagal: {e}")
+        return []
+
+
 def analyze_pdf(pdf_path: Path, folder_index: dict, path_hint: str = None) -> dict:
     total_pages = get_page_count(pdf_path)
     if total_pages == 0:
         return {}
 
-    text     = extract_text(pdf_path)
+    text     = extract_text(pdf_path)                  # digital (pdfplumber) saja
+    scanned  = len(text.strip()) < 80                  # tak ada layer teks → scan
+    page_imgs = render_pages_b64(pdf_path) if scanned else []
     filename = pdf_path.name
     existing = describe_index(folder_index)
     hint_block = (f"\nLOKASI ARSIP ASAL (petunjuk kuat dari struktur folder manusia — "
@@ -621,7 +644,7 @@ PROYEK & SUBFOLDER YANG SUDAH ADA (pakai ulang kalau cocok — JANGAN bikin ejaa
 {existing}
 
 TEKS ISI DOKUMEN:
-{text if text.strip() else "[Tidak ada teks — kemungkinan gambar/scan]"}
+{text if text.strip() else "[Dokumen hasil SCAN — baca isinya LANGSUNG dari GAMBAR halaman yang dilampirkan di pesan ini.]"}
 
 TUGASMU: Analisis dokumen dan tentukan cara filing yang tepat.
 
@@ -652,11 +675,18 @@ Format kalau TIDAK dipotong (contoh dokumen korporat):
 Format kalau DIPOTONG (tiap dokumen punya dept sendiri; invoice→Finance, penawaran→Sales):
 {{"company":"PT Krakatau Shipyard","counterparty":"PT Pertamina","should_split":true,"reason":"Campuran invoice + penawaran harga vendor","documents":[{{"doc_name":"Invoice INV-2023-001","department":"Finance","scope":"korporat","project":"Pembangunan 2 Tug Boat 2024","subfolder":"Invoice","page_start":0,"page_end":2,"expire_date":null,"doc_number":"INV-2023-001"}},{{"doc_name":"Penawaran Harga Pompa","department":"Sales","scope":"proyek","project":"Pembangunan 2 Tug Boat 2024","subfolder":"Penawaran Harga","page_start":3,"page_end":4,"expire_date":null,"doc_number":null}}]}}"""
 
+    if page_imgs:                                       # scan → kirim gambar + prompt (multimodal)
+        content = [{"type": "image", "source": {"type": "base64",
+                    "media_type": "image/jpeg", "data": b}} for b in page_imgs]
+        content.append({"type": "text", "text": prompt})
+    else:                                               # digital → teks saja
+        content = prompt
+
     try:
         response = client.messages.create(
             model=CLAUDE_MODEL,
             max_tokens=1500,
-            messages=[{"role": "user", "content": prompt}]
+            messages=[{"role": "user", "content": content}]
         )
         record_usage(response)
         raw = response.content[0].text.strip()
