@@ -32,6 +32,8 @@ import time
 import base64
 import hashlib
 import argparse
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from datetime import datetime
 
@@ -57,6 +59,9 @@ CHUNK_SIZE    = 1500     # karakter per chunk dalam satu halaman
 CHUNK_OVERLAP = 200
 # OCR_PAGE_CAP didefinisikan di blok OCR di bawah (default/high/low per doc-type).
 BATCH         = 96       # upsert_records per batch
+# Paralelisasi: OCR per-file diproses paralel (CPU tesseract/render + I/O vision).
+# Default ~ 8 core + sedikit over utk nutup tunggu I/O. >16 = thrash + rate-limit.
+WORKERS       = int(os.getenv("INDEX_WORKERS", str(min(12, (os.cpu_count() or 8) + 4))))
 CHECKPOINT    = Path("pinecone_indexed.json")   # set base_id yang sudah selesai
 
 # Metadata field yang dibawa per chunk (selain _id & chunk_text yang di-embed).
@@ -184,6 +189,19 @@ def _render_page(pdf_path: Path, page_no: int, dpi: int = 150):
         return None
 
 
+def _render_range(pdf_path: Path, last: int, dpi: int = 180):
+    """Render halaman 1..last dalam SATU panggilan poppler → {page_no: PIL image}.
+    Jauh lebih cepat dari render per-halaman (poppler cuma spawn 1×, bukan N×)."""
+    if not _RENDER_OK or last < 1:
+        return {}
+    try:
+        imgs = convert_from_path(str(pdf_path), dpi=dpi, first_page=1,
+                                 last_page=last, poppler_path=POPPLER_PATH or None)
+        return {i + 1: im for i, im in enumerate(imgs)}
+    except Exception:
+        return {}
+
+
 def _tesseract_scored(img):
     """OCR + sinyal routing dalam SATU pass (gratis). Kembalikan (text, n_kata, conf)."""
     try:
@@ -219,6 +237,11 @@ def _vision_image(img, model: str = None) -> str:
     if img is None:
         return ""
     try:
+        # Downscale: API tolak sisi >8000px; >~2200 juga mubazir (vision di-resize internal).
+        # Sekalian payload lebih kecil → lebih cepat & murah.
+        if img.width > 2200 or img.height > 2200:
+            img = img.copy()
+            img.thumbnail((2200, 2200))
         buf = io.BytesIO()
         img.save(buf, format="JPEG", quality=85)
         b64 = base64.b64encode(buf.getvalue()).decode()
@@ -304,12 +327,16 @@ def page_texts(pdf_path: Path, cap: int = None) -> list:
     real = _poppler_pagecount(pdf_path)
     for pn in range(len(pages) + 1, real + 1):
         pages.append([pn, ""])
-    for row in pages:
-        pn, t = row
-        if pn <= cap and (not t or _looks_garbled(t)):
-            v = read_scan_page(pdf_path, pn).strip()      # OCR hybrid
-            if v:
-                row[1] = v
+    # Halaman yg perlu OCR (kosong/garbled, dalam cap). Render SEKALI buat semuanya.
+    need = [pn for pn, t in pages if pn <= cap and (not t or _looks_garbled(t))]
+    if need:
+        imgs = _render_range(pdf_path, max(need))         # 1 spawn poppler, bukan N
+        for row in pages:
+            pn, t = row
+            if pn in need:
+                v = _ocr_image(imgs.get(pn)).strip()      # hybrid: tesseract→vision
+                if v:
+                    row[1] = v
     return [(pn, t) for pn, t in pages if t]
 
 
@@ -532,6 +559,7 @@ _PRICE = {  # $/1M token (input, output)
     "claude-sonnet-4-6": (3, 15), "claude-sonnet-4-5": (3, 15), "claude-haiku-4-5": (1, 5),
 }
 _USAGE = {"in": 0, "out": 0, "cost": 0.0}
+_usage_lock = threading.Lock()
 
 
 def _record_usage(model, usage):
@@ -539,8 +567,9 @@ def _record_usage(model, usage):
         return
     i, o = getattr(usage, "input_tokens", 0), getattr(usage, "output_tokens", 0)
     pin, pout = _PRICE.get(model, (3, 15))     # default tier sonnet kalau model tak dikenal
-    _USAGE["in"] += i; _USAGE["out"] += o
-    _USAGE["cost"] += i / 1e6 * pin + o / 1e6 * pout
+    with _usage_lock:                          # dipanggil dari banyak worker thread
+        _USAGE["in"] += i; _USAGE["out"] += o
+        _USAGE["cost"] += i / 1e6 * pin + o / 1e6 * pout
 
 
 def _wrap_client(client):
@@ -591,50 +620,62 @@ def index_all(dest: Path, index_name: str, model: str, namespace: str, limit: in
     print(f"  index='{index_name}' model='{model}' ns='{namespace}'\n{'='*64}\n")
 
     n_doc, n_skip, n_vec, batch = 0, 0, 0, []
+    import extract_fields as EF
 
-    def flush():
+    def flush(force=False):
         nonlocal batch, n_vec
-        if batch:
-            retry(lambda: index.upsert_records(namespace=namespace, records=batch), what="upsert")
-            n_vec += len(batch)
-            batch = []
+        while batch and (force or len(batch) >= BATCH):
+            chunk, batch = batch[:BATCH], batch[BATCH:]
+            retry(lambda c=chunk: index.upsert_records(namespace=namespace, records=c), what="upsert")
+            n_vec += len(chunk)
+
+    # File yg belum selesai (checkpoint) → diproses paralel.
+    todo = []
+    for p in files:
+        if doc_id(str(p.relative_to(dest))) in done:
+            n_skip += 1
+        else:
+            todo.append(p)
+    print(f"  {n_skip:,} sudah ke-index (skip) | {len(todo):,} diproses | {WORKERS} worker paralel\n")
+
+    def process_one(p):
+        """Kerja berat per-file (OCR+extract) — dijalankan di worker thread."""
+        base = doc_id(str(p.relative_to(dest)))
+        meta = dict(meta_map.get(str(p.resolve()), {}))
+        pages = extract_pages_any(p, cap=cap_for(meta))    # PDF/gambar/docx/xlsx; cap per doc-type
+        if ENABLE_FIELD_EXTRACT:
+            try:
+                EF.enrich(meta, " ".join(t for _, t in pages), use_llm=EXTRACT_USE_LLM)
+            except Exception:
+                pass
+        return base, records_for(p, base, meta, pages=pages), p.name, (meta.get("company") or "?")
 
     interrupted = False
+    exe = ThreadPoolExecutor(max_workers=WORKERS)
+    futs = {exe.submit(process_one, p): p for p in todo}
     try:
-        for p in files:
-            rel = str(p.relative_to(dest))
-            base = doc_id(rel)
-            if base in done:
-                n_skip += 1
+        for fut in as_completed(futs):          # main thread: upsert/checkpoint/print (serial, aman)
+            try:
+                base, recs, name, comp = fut.result()
+            except Exception as e:
+                print(f"  ⚠ gagal {futs[fut].name[:44]}: {type(e).__name__}")
                 continue
-            meta = dict(meta_map.get(str(p.resolve()), {}))   # copy → boleh di-enrich
-            pages = extract_pages_any(p, cap=cap_for(meta))    # PDF/gambar/docx/xlsx; cap per doc-type
-            if ENABLE_FIELD_EXTRACT:
-                try:
-                    import extract_fields as EF
-                    EF.enrich(meta, " ".join(t for _, t in pages), use_llm=EXTRACT_USE_LLM)
-                except Exception as e:
-                    print(f"  ⚠ extract field gagal {p.name}: {e}")
-            recs = records_for(p, base, meta, pages=pages)   # selalu >=1 (ada fallback)
-            for r in recs:
-                batch.append(r)
-                if len(batch) >= BATCH:
-                    flush()
-            flush()                      # tuntaskan per dokumen → checkpoint konsisten
+            batch.extend(recs)
+            flush()
             done.add(base)
             n_doc += 1
-            if n_doc % 10 == 0:
+            print(f"  ✓ {name[:46]:46} [{len(recs)} chunk] {comp[:20]}")
+            if n_doc % 25 == 0:
                 _save_ckpt(done)
-                todo = len(files) - n_skip
-                proj = _USAGE["cost"] / n_doc * todo if n_doc else 0.0
-                print(f"  … {n_doc}/{todo} dok, {n_vec} chunk, "
+                proj = _USAGE["cost"] / n_doc * len(todo) if n_doc else 0.0
+                print(f"  … {n_doc:,}/{len(todo):,} dok, {n_vec:,} chunk, "
                       f"💰 ${_USAGE['cost']:.2f} (proj ~${proj:.0f})")
-            comp = (meta.get('company') or '?')[:22]
-            print(f"  ✓ {p.name[:48]:48} [{len(recs)} chunk] {comp}")
     except KeyboardInterrupt:
         interrupted = True
-        print("\n  ⏸ Dihentikan user — menyimpan checkpoint...")
+        print("\n  ⏸ Dihentikan user — membatalkan antrian & menyimpan checkpoint...")
     finally:
+        exe.shutdown(wait=False, cancel_futures=True)
+        flush(force=True)
         _save_ckpt(done)              # SELALU simpan (normal / Ctrl-C / error) → resume aman
 
     if interrupted:
@@ -699,6 +740,7 @@ def main():
     ap.add_argument("--namespace", default=NAMESPACE)
     ap.add_argument("--limit", type=int, default=None, help="batasi jumlah PDF (uji coba)")
     ap.add_argument("--reset-checkpoint", action="store_true", help="abaikan checkpoint, index ulang semua")
+    ap.add_argument("--workers", type=int, default=None, help=f"worker paralel (default {WORKERS})")
     ap.add_argument("--query", default=None, help="mode tes: cari kalimat ini lalu keluar")
     args = ap.parse_args()
 
@@ -706,6 +748,8 @@ def main():
         search(args.query, index_name=args.index, namespace=args.namespace)
         return
 
+    if args.workers:
+        globals()["WORKERS"] = args.workers
     if args.reset_checkpoint and CHECKPOINT.exists():
         CHECKPOINT.unlink()
     index_all(Path(args.dest), args.index, args.model, args.namespace, args.limit)
