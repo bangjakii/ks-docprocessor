@@ -20,8 +20,11 @@ __pycache__/
 .venv/
 venv/
 archive_plan.jsonl
+archive_plan_dry.jsonl
 _test_dest/
 archive_ingest_state.jsonl
+pinecone_indexed.json
 Arsip_Rapih/
+Arsip_DryRun/
 _test_run/
 _test_run.log

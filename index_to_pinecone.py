@@ -13,7 +13,8 @@ Baca scan: default Claude VISION (teks bersih), bukan Tesseract. Ganti via
 env OCR_ENGINE=tesseract kalau mau banding/hemat.
 
 Cara pakai:
-    pip install "pinecone[asyncio]" pdfplumber pdf2image pytesseract anthropic python-dotenv
+    pip install -r requirements.txt
+    # (pinecone[asyncio] pdfplumber pdf2image pytesseract pillow python-docx openpyxl anthropic python-dotenv)
     python index_to_pinecone.py                     # index seluruh Arsip_Rapih (vision)
     python index_to_pinecone.py --limit 50           # uji 50 file dulu
     python index_to_pinecone.py --query "faktur pajak PT PAL"   # cari (tes)
@@ -25,6 +26,7 @@ Env (.env): PINECONE_API_KEY, ANTHROPIC_API_KEY (vision), POPPLER_PATH (render),
 import os
 import io
 import re
+import sys
 import json
 import time
 import base64
@@ -32,6 +34,14 @@ import hashlib
 import argparse
 from pathlib import Path
 from datetime import datetime
+
+# Konsol Windows default cp1252 → emoji/box-drawing di print() bisa crash.
+# Paksa stdout/stderr ke utf-8 utk semua entry point yg meng-import modul ini.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
 
 import pdfplumber
 from dotenv import load_dotenv
@@ -53,30 +63,84 @@ CHECKPOINT    = Path("pinecone_indexed.json")   # set base_id yang sudah selesai
 META_FIELDS = ("doc_name", "company", "counterparty", "department", "project",
                "subfolder", "relpath", "source_file", "expire_date", "doc_number")
 
-# ── Baca scan: Claude VISION (default) atau Tesseract ─────────────────────────
-# Tesseract di scan Indonesia sering ngehasilin teks rusak → embedding garbage →
-# retrieval jelek. Default-nya pakai Claude vision (teks bersih). Ganti via env
-# OCR_ENGINE=tesseract kalau mau banding / hemat.
-OCR_ENGINE     = os.getenv("OCR_ENGINE", "vision").lower()     # "vision" | "tesseract"
-VISION_MODEL   = os.getenv("VISION_MODEL", "claude-opus-4-8")  # bisa diturunin utk hemat
+# ── Baca scan: HYBRID (default) — Tesseract utk cetak, Vision utk tulisan tangan ─
+# Tesseract jalan duluan (gratis); confidence-nya jadi router: cetak rapi → pakai
+# tesseract, tulisan tangan/stempel/scan ancur → eskalasi ke Claude vision.
+# Halaman gambar/kosong minim-teks → di-SKIP (biar vision ga ngarang).
+# Override: OCR_ENGINE=tesseract (paksa tesseract) | vision (paksa vision) | hybrid.
+OCR_ENGINE     = os.getenv("OCR_ENGINE", "hybrid").lower()     # "hybrid" | "vision" | "tesseract"
+VISION_MODEL   = os.getenv("VISION_MODEL", "claude-opus-4-8")  # bisa diturunin utk hemat (bulk: haiku)
+# Scan TERJELEK (conf sangat rendah) → model vision TERKUAT (OCR paling bersih).
+# Default opus; produksi biasanya VISION_MODEL=haiku + STRONG=opus (kuat utk yg terburuk saja).
+VISION_MODEL_STRONG = os.getenv("VISION_MODEL_STRONG", "claude-opus-4-8")
+# Knob router hybrid (bisa dikalibrasi via env):
+OCR_CONF_OK     = float(os.getenv("OCR_CONF_OK", "75"))      # conf >= ini & rapi → keep tesseract (gratis)
+OCR_CONF_STRONG = float(os.getenv("OCR_CONF_STRONG", "55"))  # conf < ini → vision pakai model KUAT
+OCR_MIN_INK     = int(os.getenv("OCR_MIN_INK", "4"))         # kata < ini & low-conf → blank/drawing → skip
+# Ekstraksi field terstruktur (doc_number/expire_date/counterparty): regex gratis +
+# LLM fallback tertarget. Matikan dgn EXTRACT_FIELDS=0 (atau LLM saja: EXTRACT_LLM=0).
+ENABLE_FIELD_EXTRACT = os.getenv("EXTRACT_FIELDS", "1").lower() not in ("0", "false", "no")
+EXTRACT_USE_LLM      = os.getenv("EXTRACT_LLM", "1").lower() not in ("0", "false", "no")
 TESSERACT_PATH = os.getenv("TESSERACT_PATH")
 POPPLER_PATH   = os.getenv("POPPLER_PATH")
 try:
     import pytesseract
-    from pdf2image import convert_from_path
+    from pdf2image import convert_from_path, pdfinfo_from_path
     if TESSERACT_PATH:
         pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
     _RENDER_OK = True
 except ImportError:
     _RENDER_OK = False
 
+
+def _poppler_pagecount(pdf_path: Path) -> int:
+    """Jumlah halaman menurut poppler. Andalan saat pdfplumber lapor 0 halaman
+    (sering terjadi di PDF scan dgn page-tree yg tak terbaca pdfminer)."""
+    if not _RENDER_OK:
+        return 0
+    try:
+        info = pdfinfo_from_path(str(pdf_path), poppler_path=POPPLER_PATH or None)
+        return int(info.get("Pages", 0))
+    except Exception:
+        return 0
+
+_NOTEXT = "[TIDAK TERBACA]"
 _VISION_PROMPT = (
     "Transkripsikan SELURUH teks pada halaman dokumen ini secara verbatim (persis apa "
     "adanya) dalam bahasa aslinya: kop surat, nomor & tanggal dokumen, nama perusahaan, "
     "angka, dan isi tabel (tulis baris per baris). Pertahankan urutan baca. JANGAN "
     "merangkum, menerjemahkan, menambah komentar, atau memakai format markdown "
-    "(tanpa **, #, atau bullet) — keluarkan HANYA teks polos hasil transkripsi."
+    "(tanpa **, #, atau bullet). Keluarkan LANGSUNG teks transkripsinya saja TANPA "
+    "kalimat pembuka apa pun (jangan tulis 'Berikut', 'Saya akan', 'Teks pada dokumen', dll). "
+    "PENTING: transkripsikan HANYA teks yang benar-benar terlihat. JANGAN PERNAH menebak, "
+    "mengarang, atau melengkapi nama perusahaan, nomor, tanggal, atau isi yang tidak jelas. "
+    "Kalau ini gambar teknik/denah/diagram, tetap transkrip teks yang ada (kop, nama kapal, "
+    "dimensi, skala, nomor & judul gambar, label). "
+    f"Kalau halaman benar-benar TIDAK ADA teks atau tak terbaca, balas HANYA token {_NOTEXT} "
+    "— JANGAN menulis penjelasan, alasan, atau permintaan maaf apa pun."
 )
+
+# Pola kalimat pembuka yang kadang bocor dari model meski sudah dilarang.
+_PREAMBLE_RE = re.compile(
+    r"^\s*(?:berikut(?:\s+adalah)?|saya\s+akan|teks\s+(?:yang\s+)?(?:terlihat|pada)|"
+    r"hasil\s+transkrip\w*|transkrip\w*)[^\n:]*:\s*", re.IGNORECASE)
+# Pola PENOLAKAN/permintaan maaf model (tak terbaca tapi tanpa sentinel) — jangan di-index.
+_REFUSAL_RE = re.compile(
+    r"(saya\s+(?:tidak|tak|ga|gak)\s+(?:dapat|bisa|mampu)|tidak\s+dapat\s+(?:men|membaca)|"
+    r"maaf,?\s+(?:saya|tidak)|kualitas\s+(?:gambar|citra|dokumen)[^.\n]{0,40}"
+    r"(?:rendah|buruk|kurang)|tidak\s+ada\s+teks\s+(?:yang\s+)?(?:terlihat|terbaca|jelas)|"
+    r"i('?m| am)?\s*(?:cannot|can't|am\s+unable|unable\s+to))", re.IGNORECASE)
+
+
+def _clean_vision(t: str) -> str:
+    """Buang preamble, sentinel, & kalimat penolakan supaya tidak meracuni index."""
+    t = (t or "").strip()
+    t = _PREAMBLE_RE.sub("", t).strip()
+    if not t or t.upper().startswith(_NOTEXT) or t.upper() == _NOTEXT.strip("[]"):
+        return ""
+    if _REFUSAL_RE.search(t[:120]):       # penolakan selalu di awal respons
+        return ""
+    return t
 
 _claude_client = None
 def _get_claude():
@@ -99,17 +163,38 @@ def _render_page(pdf_path: Path, page_no: int, dpi: int = 150):
         return None
 
 
+def _tesseract_scored(img):
+    """OCR + sinyal routing dalam SATU pass (gratis). Kembalikan (text, n_kata, conf)."""
+    try:
+        data = pytesseract.image_to_data(
+            img, lang="ind+eng", output_type=pytesseract.Output.DICT)
+    except Exception:
+        return "", 0, 0.0
+    words, confs = [], []
+    for txt, c in zip(data["text"], data["conf"]):
+        t = (txt or "").strip()
+        try:
+            c = float(c)
+        except (TypeError, ValueError):
+            c = -1.0
+        if t and c >= 0:
+            words.append(t)
+            confs.append(c)
+    text = " ".join(words)
+    conf = sum(confs) / len(confs) if confs else 0.0
+    return text, len(words), conf
+
+
 def _tesseract_page(pdf_path: Path, page_no: int) -> str:
     img = _render_page(pdf_path, page_no, dpi=180)
-    try:
-        return pytesseract.image_to_string(img, lang="ind+eng") if img is not None else ""
-    except Exception:
+    if img is None:
         return ""
+    return _tesseract_scored(img)[0]
 
 
-def _vision_page(pdf_path: Path, page_no: int) -> str:
-    """Baca halaman scan pakai Claude vision → teks bersih (jauh > Tesseract di scan ID)."""
-    img = _render_page(pdf_path, page_no, dpi=150)
+def _vision_image(img, model: str = None) -> str:
+    """Kirim PIL image ke Claude vision → teks bersih. Dipisah biar bisa reuse
+    render yang sama dari router hybrid (ga render 2x). model=None → VISION_MODEL."""
     if img is None:
         return ""
     try:
@@ -117,23 +202,50 @@ def _vision_page(pdf_path: Path, page_no: int) -> str:
         img.save(buf, format="JPEG", quality=85)
         b64 = base64.b64encode(buf.getvalue()).decode()
         msg = _get_claude().messages.create(
-            model=VISION_MODEL, max_tokens=2048,
+            model=model or VISION_MODEL, max_tokens=2048,
             messages=[{"role": "user", "content": [
                 {"type": "image", "source": {"type": "base64",
                  "media_type": "image/jpeg", "data": b64}},
                 {"type": "text", "text": _VISION_PROMPT},
             ]}],
         )
-        return "".join(b.text for b in msg.content if getattr(b, "type", None) == "text").strip()
+        raw = "".join(b.text for b in msg.content if getattr(b, "type", None) == "text")
+        return _clean_vision(raw)
     except Exception as e:
-        print(f"    ⚠ vision gagal hal {page_no} {pdf_path.name}: {e}")
+        print(f"    ⚠ vision gagal: {e}")
         return ""
 
 
+def _vision_page(pdf_path: Path, page_no: int) -> str:
+    return _vision_image(_render_page(pdf_path, page_no, dpi=180))
+
+
+def _ocr_image(img) -> str:
+    """Hybrid OCR pada satu PIL image (dipakai PDF maupun file gambar).
+    tesseract dulu (gratis); confidence routing → cetak=tesseract,
+    tulisan tangan/stempel=vision, gambar/kosong minim-teks=skip."""
+    if img is None:
+        return ""
+    if OCR_ENGINE == "vision":
+        return _vision_image(img)
+    text, n_words, conf = _tesseract_scored(img)
+    if OCR_ENGINE == "tesseract":
+        return text
+    # ── hybrid ──
+    if n_words == 0:
+        return ""                                    # ga ada teks → blank/drawing
+    if conf >= OCR_CONF_OK and not _looks_garbled(text):
+        return text                                  # cetak yakin & rapi → GRATIS ✅
+    if n_words < OCR_MIN_INK:
+        return ""                                    # low-conf & nyaris kosong → drawing → skip
+    # ada tinta tapi ragu → vision. Scan TERJELEK (conf sangat rendah) → model KUAT.
+    model = VISION_MODEL_STRONG if conf < OCR_CONF_STRONG else VISION_MODEL
+    return _vision_image(img, model=model)
+
+
 def read_scan_page(pdf_path: Path, page_no: int) -> str:
-    """Baca satu halaman scan sesuai OCR_ENGINE."""
-    return _tesseract_page(pdf_path, page_no) if OCR_ENGINE == "tesseract" \
-        else _vision_page(pdf_path, page_no)
+    """Baca satu halaman scan PDF (render → _ocr_image)."""
+    return _ocr_image(_render_page(pdf_path, page_no, dpi=180))
 
 
 def _looks_garbled(t: str) -> bool:
@@ -162,7 +274,12 @@ def page_texts(pdf_path: Path) -> list:
                 pages.append([i + 1, (page.extract_text() or "").strip()])
     except Exception as e:
         print(f"  ⚠ gagal buka {pdf_path.name}: {e}")
-        return []
+        pages = []
+    # pdfplumber kadang lapor 0/kurang halaman utk PDF scan tertentu, padahal
+    # poppler bisa render. Tambal halaman yg hilang (kosong) → diisi vision di bawah.
+    real = _poppler_pagecount(pdf_path)
+    for pn in range(len(pages) + 1, real + 1):
+        pages.append([pn, ""])
     for row in pages:
         pn, t = row
         if pn <= OCR_PAGE_CAP and (not t or _looks_garbled(t)):
@@ -170,6 +287,85 @@ def page_texts(pdf_path: Path) -> list:
             if v:
                 row[1] = v
     return [(pn, t) for pn, t in pages if t]
+
+
+# ── Non-PDF: gambar (OCR), Office modern (ekstrak teks) ───────────────────────
+_IMG_EXT  = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".gif"}
+_DOCX_EXT = {".docx"}
+_XLSX_EXT = {".xlsx", ".xlsm"}
+# Diindex via FALLBACK record (nama+metadata) saja — legacy/biner tak terbaca teksnya.
+_FALLBACK_EXT = {".doc", ".xls", ".ppt", ".pptx", ".rtf", ".dwg", ".dxf", ".zip", ".rar"}
+SUPPORTED_EXT = {".pdf"} | _IMG_EXT | _DOCX_EXT | _XLSX_EXT | _FALLBACK_EXT
+
+
+def image_texts(path: Path) -> list:
+    """File gambar (.jpg/.png/…) → 1 'halaman', OCR hybrid (tanpa poppler)."""
+    try:
+        from PIL import Image
+        img = Image.open(path)
+        img.load()
+        if img.mode not in ("RGB", "L"):
+            img = img.convert("RGB")
+    except Exception as e:
+        print(f"  ⚠ gagal buka gambar {path.name}: {e}")
+        return []
+    t = _ocr_image(img).strip()
+    return [(1, t)] if t else []
+
+
+def docx_texts(path: Path) -> list:
+    """.docx → teks paragraf + tabel (digital, gratis)."""
+    try:
+        import docx
+        d = docx.Document(str(path))
+        parts = [p.text for p in d.paragraphs if p.text and p.text.strip()]
+        for tbl in d.tables:
+            for row in tbl.rows:
+                cells = [c.text.strip() for c in row.cells if c.text and c.text.strip()]
+                if cells:
+                    parts.append(" | ".join(cells))
+        t = "\n".join(parts).strip()
+    except Exception as e:
+        print(f"  ⚠ gagal baca docx {path.name}: {e}")
+        return []
+    return [(1, t)] if t else []
+
+
+def xlsx_texts(path: Path) -> list:
+    """.xlsx/.xlsm → 1 'halaman' per sheet (digital, gratis)."""
+    try:
+        import openpyxl
+        wb = openpyxl.load_workbook(str(path), read_only=True, data_only=True)
+        pages = []
+        for i, ws in enumerate(wb.worksheets, 1):
+            rows = []
+            for row in ws.iter_rows(values_only=True):
+                vals = [str(c) for c in row if c is not None and str(c).strip()]
+                if vals:
+                    rows.append(" | ".join(vals))
+            t = "\n".join(rows).strip()
+            if t:
+                pages.append((i, t))
+        wb.close()
+        return pages
+    except Exception as e:
+        print(f"  ⚠ gagal baca xlsx {path.name}: {e}")
+        return []
+
+
+def extract_pages_any(path: Path) -> list:
+    """Dispatcher per ekstensi → [(page, text)]. Tipe tak terdukung → [] (nanti
+    dapat fallback record nama+metadata di records_for)."""
+    s = path.suffix.lower()
+    if s == ".pdf":
+        return page_texts(path)
+    if s in _IMG_EXT:
+        return image_texts(path)
+    if s in _DOCX_EXT:
+        return docx_texts(path)
+    if s in _XLSX_EXT:
+        return xlsx_texts(path)
+    return []
 
 
 # ── Chunking per-halaman ──────────────────────────────────────────────────────
@@ -195,19 +391,35 @@ def doc_id(rel: str) -> str:
     return hashlib.md5(rel.encode("utf-8")).hexdigest()[:16]
 
 
-def records_for(pdf_path: Path, base_id: str, meta: dict) -> list:
-    """Bangun record per (halaman, sub-chunk) dengan metadata file yang utuh."""
+def _apply_meta(rec: dict, meta: dict) -> dict:
+    for f in META_FIELDS:
+        v = meta.get(f)
+        rec[f] = "" if v is None else str(v)
+    return rec
+
+
+def records_for(pdf_path: Path, base_id: str, meta: dict, pages=None) -> list:
+    """Bangun record per (halaman, sub-chunk) dengan metadata file yang utuh.
+    `pages` boleh dioper (hasil page_texts yg sudah dihitung) biar tidak OCR 2x."""
+    if pages is None:
+        pages = page_texts(pdf_path)
     recs, k = [], 0
-    for page_no, text in page_texts(pdf_path):
+    for page_no, text in pages:
         for j, chunk in enumerate(chunk_text(text)):
             rec = {"_id": f"{base_id}_p{page_no}_{j}", "chunk_text": chunk,
                    "page_number": page_no, "chunk_index": k,
                    "filename": pdf_path.name}
-            for f in META_FIELDS:
-                v = meta.get(f)
-                rec[f] = "" if v is None else str(v)
-            recs.append(rec)
+            recs.append(_apply_meta(rec, meta))
             k += 1
+    if not recs:
+        # JAMINAN: tiap file minimal 1 record → selalu ke-index & ketemu via
+        # nama/metadata walau OCR nol teks (drawing murni / gambar / scan kosong).
+        name = meta.get("doc_name") or pdf_path.stem
+        ctx = " ".join(str(x) for x in (name, meta.get("project"), meta.get("company"),
+                                        meta.get("subfolder")) if x)
+        rec = {"_id": f"{base_id}_p0_0", "chunk_text": ctx or name,
+               "page_number": 0, "chunk_index": 0, "filename": pdf_path.name}
+        recs.append(_apply_meta(rec, meta))
     return recs
 
 
@@ -297,14 +509,18 @@ def index_all(dest: Path, index_name: str, model: str, namespace: str, limit: in
     meta_map = load_meta_map(dest)
     done = _load_ckpt()
 
-    pdfs = [p for p in dest.rglob("*.pdf")]
+    files = [p for p in dest.rglob("*")
+             if p.is_file() and p.suffix.lower() in SUPPORTED_EXT and p.name != "archive_log.json"]
     if limit:
-        pdfs = pdfs[:limit]
-    if not pdfs:
-        print(f"\n📂 Tidak ada PDF di {dest}. Jalankan ingest_archive.py --apply dulu.\n")
+        files = files[:limit]
+    if not files:
+        print(f"\n📂 Tidak ada file terdukung di {dest}. Jalankan ingest_archive.py --apply dulu.\n")
         return
 
-    print(f"\n{'='*64}\n  KS Pinecone Indexer — {len(pdfs)} PDF di {dest}")
+    from collections import Counter as _C
+    _ext = _C(p.suffix.lower() for p in files)
+    print(f"\n{'='*64}\n  KS Pinecone Indexer — {len(files)} file di {dest}")
+    print(f"  tipe: {dict(_ext.most_common())}")
     print(f"  index='{index_name}' model='{model}' ns='{namespace}'\n{'='*64}\n")
 
     n_doc, n_skip, n_vec, batch = 0, 0, 0, []
@@ -316,19 +532,21 @@ def index_all(dest: Path, index_name: str, model: str, namespace: str, limit: in
             n_vec += len(batch)
             batch = []
 
-    for p in pdfs:
+    for p in files:
         rel = str(p.relative_to(dest))
         base = doc_id(rel)
         if base in done:
             n_skip += 1
             continue
-        meta = meta_map.get(str(p.resolve()), {})
-        recs = records_for(p, base, meta)
-        if not recs:
-            print(f"  ⚠ {p.name}: tak ada teks (scan gagal OCR?) — skip")
-            n_skip += 1
-            done.add(base)          # jangan coba ulang terus
-            continue
+        meta = dict(meta_map.get(str(p.resolve()), {}))   # copy → boleh di-enrich
+        pages = extract_pages_any(p)                       # PDF / gambar / docx / xlsx
+        if ENABLE_FIELD_EXTRACT:
+            try:
+                import extract_fields as EF
+                EF.enrich(meta, " ".join(t for _, t in pages), use_llm=EXTRACT_USE_LLM)
+            except Exception as e:
+                print(f"  ⚠ extract field gagal {p.name}: {e}")
+        recs = records_for(p, base, meta, pages=pages)   # selalu >=1 (ada fallback)
         for r in recs:
             batch.append(r)
             if len(batch) >= BATCH:

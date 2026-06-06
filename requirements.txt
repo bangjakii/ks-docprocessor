@@ -1,0 +1,20 @@
+# KS doc processor — dependencies
+# Inti pipeline
+anthropic                 # klasifikasi (process_docs/ingest) + vision OCR + LLM field extraction
+python-dotenv             # baca .env
+
+# Pinecone (integrated embedding, multilingual-e5-large — TANPA OpenAI)
+pinecone[asyncio]
+
+# PDF → teks & render
+pdfplumber                # ekstrak teks PDF digital
+pdf2image                 # render PDF→gambar + hitung halaman (butuh poppler terinstall)
+pytesseract               # OCR tulisan cetak (butuh Tesseract-OCR terinstall)
+pillow                    # baca file gambar (.jpg/.png/…) utk OCR
+
+# Office modern (ekstrak teks, gratis)
+python-docx               # .docx
+openpyxl                  # .xlsx/.xlsm
+
+# Catatan: poppler & Tesseract adalah binary eksternal (set POPPLER_PATH / TESSERACT_PATH di .env).
+# Legacy .doc/.xls hanya dapat fallback record (nama+metadata), tidak diekstrak teksnya.
