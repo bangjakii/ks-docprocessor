@@ -526,6 +526,47 @@ def _save_ckpt(done: set):
     CHECKPOINT.write_text(json.dumps(sorted(done)), encoding="utf-8")
 
 
+# ── Meter biaya (token Claude → USD) ──────────────────────────────────────────
+_PRICE = {  # $/1M token (input, output)
+    "claude-opus-4-8": (5, 25), "claude-opus-4-7": (5, 25), "claude-opus-4-6": (5, 25),
+    "claude-sonnet-4-6": (3, 15), "claude-sonnet-4-5": (3, 15), "claude-haiku-4-5": (1, 5),
+}
+_USAGE = {"in": 0, "out": 0, "cost": 0.0}
+
+
+def _record_usage(model, usage):
+    if not usage:
+        return
+    i, o = getattr(usage, "input_tokens", 0), getattr(usage, "output_tokens", 0)
+    pin, pout = _PRICE.get(model, (3, 15))     # default tier sonnet kalau model tak dikenal
+    _USAGE["in"] += i; _USAGE["out"] += o
+    _USAGE["cost"] += i / 1e6 * pin + o / 1e6 * pout
+
+
+def _wrap_client(client):
+    if client is None or getattr(client, "_ks_metered", False):
+        return client
+    orig = client.messages.create
+    def create(**kw):
+        r = orig(**kw)
+        _record_usage(kw.get("model"), getattr(r, "usage", None))
+        return r
+    client.messages.create = create
+    client._ks_metered = True
+    return client
+
+
+def _enable_cost_meter():
+    """Bungkus client vision (IX) & extraction (EF) supaya token tiap panggilan
+    Claude terakumulasi → biaya bisa dipantau live saat produksi."""
+    _wrap_client(_get_claude())
+    try:
+        import extract_fields as EF
+        EF._client = _wrap_client(EF._claude())
+    except Exception:
+        pass
+
+
 # ── Indexing utama ────────────────────────────────────────────────────────────
 
 def index_all(dest: Path, index_name: str, model: str, namespace: str, limit: int):
@@ -533,6 +574,7 @@ def index_all(dest: Path, index_name: str, model: str, namespace: str, limit: in
     index = ensure_index(pc, index_name, model)
     meta_map = load_meta_map(dest)
     done = _load_ckpt()
+    _enable_cost_meter()
 
     files = [p for p in dest.rglob("*")
              if p.is_file() and p.suffix.lower() in SUPPORTED_EXT and p.name != "archive_log.json"]
@@ -583,7 +625,10 @@ def index_all(dest: Path, index_name: str, model: str, namespace: str, limit: in
             n_doc += 1
             if n_doc % 10 == 0:
                 _save_ckpt(done)
-                print(f"  … {n_doc} dokumen, {n_vec} chunk")
+                todo = len(files) - n_skip
+                proj = _USAGE["cost"] / n_doc * todo if n_doc else 0.0
+                print(f"  … {n_doc}/{todo} dok, {n_vec} chunk, "
+                      f"💰 ${_USAGE['cost']:.2f} (proj ~${proj:.0f})")
             comp = (meta.get('company') or '?')[:22]
             print(f"  ✓ {p.name[:48]:48} [{len(recs)} chunk] {comp}")
     except KeyboardInterrupt:
@@ -597,6 +642,10 @@ def index_all(dest: Path, index_name: str, model: str, namespace: str, limit: in
               f"'python index_to_pinecone.py' untuk lanjut dari sini.")
     print(f"\n{'='*64}")
     print(f"  ✅ {n_doc} dokumen di-index ({n_vec} chunk), {n_skip} skip")
+    print(f"  💰 Biaya Claude: ${_USAGE['cost']:.2f}  "
+          f"(in {_USAGE['in']:,} / out {_USAGE['out']:,} token)")
+    if n_doc:
+        print(f"     rata-rata ${_USAGE['cost']/n_doc:.4f}/dok")
     print(f"  🔢 Namespace '{namespace}' di index '{index_name}'")
     print(f"{'='*64}\n")
 
