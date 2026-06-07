@@ -487,8 +487,19 @@ def records_for(pdf_path: Path, base_id: str, meta: dict, pages=None) -> list:
 
 # ── Metadata dari archive_log.json ────────────────────────────────────────────
 
+def _rel_key(output_file: str, base: str) -> str:
+    """Key metadata NETRAL-OS: path output_file relatif terhadap _dest, pakai '/'.
+    Bikin archive_log.json (dibuat di Windows, path 'D:\\...') tetap kebaca saat
+    indexing dijalankan di Linux/VPS (dest beda)."""
+    of = str(output_file).replace("\\", "/")
+    b = str(base or "").replace("\\", "/").rstrip("/")
+    if b and of.lower().startswith(b.lower() + "/"):
+        return of[len(b) + 1:]
+    return of.split("/")[-1]                  # fallback: nama file saja
+
+
 def load_meta_map(dest: Path) -> dict:
-    """output_file (absolut) → entri metadata, dari archive_log.json hasil ingest."""
+    """relpath-dalam-dest (netral-OS) → entri metadata, dari archive_log.json."""
     log = dest / "archive_log.json"
     mp = {}
     if not log.exists():
@@ -497,7 +508,7 @@ def load_meta_map(dest: Path) -> dict:
     try:
         for e in json.loads(log.read_text(encoding="utf-8")):
             if e.get("output_file") and e.get("status") == "ok":
-                mp[str(Path(e["output_file"]).resolve())] = e
+                mp[_rel_key(e["output_file"], e.get("_dest"))] = e
     except Exception as e:
         print(f"  ⚠ gagal baca log: {e}")
     return mp
@@ -639,10 +650,11 @@ def index_all(dest: Path, index_name: str, model: str, namespace: str, limit: in
             retry(lambda c=chunk: index.upsert_records(namespace=namespace, records=c), what="upsert")
             n_vec += len(chunk)
 
-    # File yg belum selesai (checkpoint) → diproses paralel.
+    # File yg belum selesai (checkpoint) → diproses paralel. Key relatif slash-'/'
+    # (netral-OS) supaya doc_id & checkpoint konsisten lintas Windows/Linux.
     todo = []
     for p in files:
-        if doc_id(str(p.relative_to(dest))) in done:
+        if doc_id(str(p.relative_to(dest)).replace("\\", "/")) in done:
             n_skip += 1
         else:
             todo.append(p)
@@ -650,8 +662,9 @@ def index_all(dest: Path, index_name: str, model: str, namespace: str, limit: in
 
     def process_one(p):
         """Kerja berat per-file (OCR+extract) — dijalankan di worker thread."""
-        base = doc_id(str(p.relative_to(dest)))
-        meta = dict(meta_map.get(str(p.resolve()), {}))
+        rel = str(p.relative_to(dest)).replace("\\", "/")      # key netral-OS
+        base = doc_id(rel)
+        meta = dict(meta_map.get(rel, {}))
         pages = extract_pages_any(p, cap=cap_for(meta))    # PDF/gambar/docx/xlsx; cap per doc-type
         if ENABLE_FIELD_EXTRACT:
             try:
