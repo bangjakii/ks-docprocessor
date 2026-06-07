@@ -20,8 +20,8 @@ webui/
 Dua terminal, dari **root repo**:
 
 ```powershell
-# Terminal 1 — backend
-uvicorn webui.backend.main:app --reload --port 8000
+# Terminal 1 — backend (pakai `python -m`; `uvicorn` saja sering tidak ada di PATH Windows)
+python -m uvicorn webui.backend.main:app --reload --port 8000
 
 # Terminal 2 — frontend
 cd webui\frontend
@@ -33,7 +33,7 @@ npm run dev        # buka http://localhost:5173
 ```powershell
 cd webui\frontend && npm install && npm run build   # hasil → frontend/dist
 cd ..\..
-uvicorn webui.backend.main:app --host 0.0.0.0 --port 8000
+python -m uvicorn webui.backend.main:app --host 0.0.0.0 --port 8000
 # buka http://<ip-server>:8000  (frontend disajikan langsung oleh FastAPI)
 ```
 
